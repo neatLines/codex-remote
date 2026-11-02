@@ -1,0 +1,18 @@
+{
+  "name": "codex-remote",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mobile Web Remote Control for local Codex App-Server with TOTP 2FA and E2E HMAC verification",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "codex-up": "./bin/codex-up"
+  },
+  "scripts": {
+    "cloud": "node src/cloud-server.mjs",
+    "agent": "node src/local-agent.mjs",
+    "test": "node --test test/*.test.mjs"
+  }
+}

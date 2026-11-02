@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff" />
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#141417" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <title>Codex Remote</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <!-- 1. TOTP 2FA 登录视图 -->
+  <div id="login-view" class="view hidden">
+    <div class="login-card">
+      <div class="brand-header">
+        <div class="brand-logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="4 17 10 11 4 5"></polyline>
+            <line x1="12" y1="19" x2="20" y2="19"></line>
+          </svg>
+        </div>
+        <h1>Codex Remote</h1>
+        <p class="subtitle">连接本机工作区与会话</p>
+      </div>
+      <form id="login-form" autocomplete="on">
+        <div class="field">
+          <label for="login-password">访问口令</label>
+          <input id="login-password" name="password" type="password" required placeholder="输入访问口令" autocomplete="current-password" />
+        </div>
+        <div class="field">
+          <label for="login-totp">TOTP 6位动态码</label>
+          <input id="login-totp" name="totp" type="text" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required placeholder="000000" autocomplete="one-time-code" />
+        </div>
+        <div id="login-error" class="error-box hidden"></div>
+        <button type="submit" id="login-submit" class="btn-primary full-width">登录 (30天免密)</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- 2. 主控制台视图 (PC端左右分栏 / 手机端自适应抽屉) -->
+  <div id="app-view" class="view hidden">
+    <!-- 移动端抽屉遮罩 -->
+    <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+
+    <!-- 左侧栏：多设备 + 多工作区 + 会话树 -->
+    <aside id="sidebar-drawer" class="sidebar-drawer">
+      <div class="drawer-header">
+        <div class="drawer-agent-row">
+          <label for="agent-select">设备</label>
+          <select id="agent-select" class="select-input"></select>
+        </div>
+        <div class="drawer-sub-actions">
+          <button id="btn-refresh-threads" class="btn-ghost">刷新</button>
+          <button id="btn-browse-dir" class="btn-ghost">目录</button>
+          <button id="btn-switch-profile" class="btn-ghost">Profile</button>
+        </div>
+      </div>
+
+      <div class="drawer-search">
+        <input id="thread-search-input" type="search" placeholder="搜索会话..." />
+      </div>
+
+      <div id="workspaces-container" class="workspaces-list">
+        <!-- 动态渲染按工作区分组的会话列表 -->
+      </div>
+
+      <button id="btn-more-threads" class="btn-ghost hidden">加载更多会话</button>
+      <div class="drawer-footer">
+        <button id="btn-logout" class="btn-ghost danger-text">退出登录</button>
+      </div>
+    </aside>
+
+    <!-- 右侧主工作区 -->
+    <div class="main-panel">
+      <!-- 顶部导航栏 -->
+      <header class="topbar">
+        <button id="btn-drawer" class="icon-btn" title="展开/收起侧边栏" aria-label="侧边栏">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <line x1="3" y1="6" x2="21" y2="6"></line>
+            <line x1="3" y1="12" x2="21" y2="12"></line>
+            <line x1="3" y1="18" x2="21" y2="18"></line>
+          </svg>
+        </button>
+        <div class="topbar-center">
+          <div class="topbar-title-row">
+            <span id="current-thread-title" class="thread-title">选择或新建会话</span>
+          </div>
+          <div class="topbar-meta-row">
+            <span id="current-workspace-badge" class="workspace-badge">未选择工作区</span>
+            <span id="ws-status-dot" class="status-dot offline" title="连接状态"></span>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <a id="btn-dsh-web" class="dsh-link hidden" target="_blank" rel="noopener noreferrer">DSH</a>
+          <button id="btn-e2e-key" class="icon-btn" title="配对密钥" aria-label="配对密钥">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+            </svg>
+          </button>
+          <button id="btn-new-thread" class="icon-btn primary-icon" title="新建对话" aria-label="新建对话">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <line x1="12" y1="5" x2="12" y2="19"></line>
+              <line x1="5" y1="12" x2="19" y2="12"></line>
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- 待信任的新设备横幅 -->
+      <div id="untrusted-banner" class="banner warning-banner hidden"></div>
+
+      <!-- E2E 密钥未配置提示横幅 -->
+      <div id="e2e-banner" class="banner info-banner hidden">
+        <span>当前设备启用了端到端签名保护，发送指令前需填入配对密钥</span>
+        <button id="btn-banner-e2e" class="btn-small">填写密钥</button>
+      </div>
+
+      <!-- 对话消息流主区域 -->
+      <main id="chat-container" class="chat-container">
+        <div id="chat-empty" class="chat-empty">
+          <div class="empty-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="4 17 10 11 4 5"></polyline>
+              <line x1="12" y1="19" x2="20" y2="19"></line>
+            </svg>
+          </div>
+          <h2>远程控制你的 Codex</h2>
+          <p>在工作区列表中切换任意项目与历史会话，或在下方直接发送新指令。</p>
+          <div id="quick-workspaces" class="quick-workspaces"></div>
+        </div>
+        <button id="btn-load-history" class="btn-ghost history-more hidden">加载更早消息</button>
+        <div id="chat-messages" class="chat-messages"></div>
+        <div id="thread-status" class="thread-status hidden" role="status" aria-live="polite"></div>
+      </main>
+
+      <div class="chat-quick-actions">
+        <button id="btn-pending-requests" class="btn-small hidden">待处理请求</button>
+        <button id="btn-jump-latest" class="btn-small hidden">回到最新消息 ↓</button>
+      </div>
+
+      <!-- 底部消息输入栏 + 模型/推理强度控制栏 -->
+      <footer class="composer">
+        <div class="composer-toolbar">
+          <div class="model-pill" title="选择模型">
+            <span class="pill-label">模型</span>
+            <select id="model-select" class="pill-select" aria-label="模型选择">
+              <option value="gpt-6-astra">GPT-6-Astra</option>
+            </select>
+          </div>
+          <div class="model-pill" title="选择推理强度">
+            <span class="pill-label">推理</span>
+            <select id="effort-select" class="pill-select" aria-label="推理强度">
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="xhigh" selected>XHigh</option>
+              <option value="max">Max</option>
+              <option value="ultra">Ultra</option>
+            </select>
+          </div>
+        </div>
+        <div class="composer-inner">
+          <textarea id="prompt-input" rows="1" placeholder="输入指令..."></textarea>
+          <button id="btn-stop-turn" class="btn-stop hidden" title="停止生成" aria-label="停止">停止</button>
+          <button id="btn-send" class="btn-send" title="发送">发送</button>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <!-- 弹窗 1：端到端配对密钥设置 -->
+  <div id="modal-e2e" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <h3>端到端配对密钥</h3>
+      <p class="modal-desc">
+        在本机运行 <code>codex-up --show-pairing-key</code>，输入显示的配对密钥（如 <code>XXXX-XXXX-XXXX</code>）。密钥仅保存在当前浏览器本地，云服务器无法获知。
+      </p>
+      <div class="field">
+        <label for="input-e2e-key">配对密钥 (LOCAL_SIGNING_KEY)</label>
+        <input id="input-e2e-key" type="text" placeholder="XXXX-XXXX-XXXX" autocomplete="off" />
+      </div>
+      <div id="e2e-fingerprint-hint" class="hint-text"></div>
+      <div class="modal-actions">
+        <button id="btn-close-e2e" class="btn-ghost">取消</button>
+        <button id="btn-save-e2e" class="btn-primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 弹窗 2：浏览本机文件夹选择工作区 -->
+  <div id="modal-dir" class="modal-backdrop hidden">
+    <div class="modal-card modal-large">
+      <h3>选择工作区目录</h3>
+      <div class="dir-current-bar">
+        <input id="input-dir-path" type="text" placeholder="项目目录的绝对路径" />
+        <button id="btn-dir-go" class="btn-small">前往</button>
+      </div>
+      <div id="dir-entries-list" class="dir-entries-list"></div>
+      <div class="modal-actions">
+        <button id="btn-close-dir" class="btn-ghost">关闭</button>
+        <button id="btn-select-dir" class="btn-primary">在此目录新建对话</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

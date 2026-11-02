@@ -1,0 +1,41 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+auth.json
+remote-agent-identity.json
+
+# Local runtime state and agent tooling
+/data/
+/certs/
+/.codex/
+/.agents/
+/.aws/
+/.ssh/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.db
+*.db-*
+*.jsonl
+*.log
+*.pid
+
+# Dependencies, test artifacts and backups
+node_modules/
+coverage/
+test-results/
+playwright-report/
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.bak
+*.orig
+.DS_Store
