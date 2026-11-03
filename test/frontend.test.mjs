@@ -98,7 +98,7 @@ function setup(options = {}) {
   const interactions = fs.readFileSync(new URL('../src/public/interactions.js', import.meta.url), 'utf8')
     .replace(/^import .*;$/gm, '').replace(/^export /gm, '');
   source = interactions + '\n' + source;
-  vm.runInContext(source + '\nglobalThis.app = { state, el, getThreadView, createThreadView, activateThreadView, openExistingThread, startNewThreadInWorkspace, sendUserPrompt, handleIncomingCodexPayload, rejectPendingRpc, syncThreadControls, applyAgentState, submitInteraction, loadThreadHistory, loadWorkspacesAndThreads, renderThreadItem, syncAgentState, renderWorkspacesDrawer, loadCloudFiles, refreshVisibleThread, scheduleHistoryRefresh, document };', context);
+  vm.runInContext(source + '\nglobalThis.app = { state, el, getThreadView, createThreadView, activateThreadView, openExistingThread, startNewThreadInWorkspace, sendUserPrompt, handleIncomingCodexPayload, rejectPendingRpc, syncThreadControls, applyAgentState, submitInteraction, loadThreadHistory, loadWorkspacesAndThreads, renderThreadItem, syncAgentState, renderWorkspacesDrawer, loadCloudFiles, refreshVisibleThread, scheduleHistoryRefresh, openDirectoryBrowser, document };', context);
   const app = context.app;
   app.state.selectedAgentId = 'agent';
   app.state.agents = [{ agentId: 'agent', online: true, trusted: true }];
@@ -981,4 +981,56 @@ test('stale list replies cannot replace a newer manual refresh', async () => {
   await background;
   assert.equal(app.state.threads[0].id, 'latest');
   assert.equal(app.state.loadingThreads, false);
+});
+
+test('workspace directory selection handles native fileName entries and navigates into the selected child', async () => {
+  const app = setup();
+  const loading = app.openDirectoryBrowser('/workspace/');
+  assert.equal(app.sent[0].payload.method, 'fs/readDirectory');
+  assert.equal(app.sent[0].payload.params.path, '/workspace/');
+  app.respond(app.sent[0], { entries: [
+    { fileName: 'z-project', isDirectory: true, isFile: false },
+    { fileName: 'a project', isDirectory: true, isFile: false },
+    { fileName: '.private', isDirectory: true, isFile: false },
+    { fileName: 'README.md', isDirectory: false, isFile: true },
+  ] });
+  await loading;
+  const rows = app.el.dirEntriesList.querySelectorAll('.dir-entry');
+  assert.deepEqual(rows.map((row) => row.textContent), ['.. (返回上级目录)', 'a project/', 'z-project/']);
+  const child = rows[1].onclick();
+  assert.equal(app.sent[1].payload.params.path, '/workspace/a project');
+  app.respond(app.sent[1], { entries: [] });
+  await child;
+  app.el.btnSelectDir.onclick();
+  assert.equal(app.state.selectedCwd, '/workspace/a project');
+  assert.equal(app.state.currentThreadId, null);
+});
+
+test('directory browsing accepts legacy names and skips incomplete entries without throwing', async () => {
+  const app = setup();
+  const loading = app.openDirectoryBrowser('/');
+  app.respond(app.sent[0], { entries: [
+    null, { isDirectory: true }, { fileName: 42, isDirectory: true },
+    { name: 'legacy', isDirectory: true }, { fileName: '<project>', isDirectory: true },
+  ] });
+  await loading;
+  assert.deepEqual(app.el.dirEntriesList.querySelectorAll('.dir-entry').map((row) => row.textContent), ['<project>/', 'legacy/']);
+  assert.equal(app.el.dirEntriesList.querySelectorAll('project').length, 0);
+});
+
+test('older directory replies and failures cannot overwrite the latest navigation or another device', async () => {
+  const app = setup();
+  const old = app.openDirectoryBrowser('/old');
+  const latest = app.openDirectoryBrowser('/new');
+  app.respond(app.sent[1], { entries: [{ fileName: 'current', isDirectory: true }] });
+  await latest;
+  app.respond(app.sent[0], undefined, { message: 'old failure' });
+  await old;
+  assert.equal(app.el.inputDirPath.value, '/new');
+  assert.match(app.el.dirEntriesList.textContent, /current/);
+  const stale = app.openDirectoryBrowser('/stale');
+  app.state.selectedAgentId = 'other';
+  app.respond(app.sent[2], { entries: [{ fileName: 'wrong-device', isDirectory: true }] });
+  await stale;
+  assert.equal(app.el.dirEntriesList.querySelectorAll('.dir-entry').length, 0);
 });

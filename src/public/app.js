@@ -120,6 +120,7 @@ const state = {
   threadsLoadedAt: 0,
   refreshTimer: null,
   refreshing: false,
+  directoryRequest: 0,
   threadViews: new Map(),
   currentView: null,
   collapsedWorkspaces: new Set(),
@@ -1550,15 +1551,21 @@ function openE2EModal(hint = '') {
 
 async function openDirectoryBrowser(dirPath) {
   const agent = getSelectedAgent();
+  const agentId = state.selectedAgentId;
+  const request = ++state.directoryRequest;
   const targetPath = dirPath || state.selectedCwd || agent?.defaultCwd || '/';
   el.inputDirPath.value = targetPath;
   el.modalDir.classList.remove('hidden');
   el.dirEntriesList.innerHTML = '<div style="padding:12px;color:var(--text-secondary)">读取目录中...</div>';
 
   try {
-    const res = await sendCodexRpc('fs/readDirectory', { path: targetPath });
-    const entries = (res.entries || [])
-      .filter((e) => e.isDirectory && !e.name.startsWith('.'))
+    const res = await sendCodexRpc('fs/readDirectory', { path: targetPath }, agentId);
+    if (request !== state.directoryRequest || agentId !== state.selectedAgentId) return;
+    // Native app-server uses fileName; accept name from older implementations.
+    const entries = (Array.isArray(res?.entries) ? res.entries : [])
+      .filter((entry) => entry?.isDirectory)
+      .map((entry) => ({ name: entry.fileName ?? entry.name }))
+      .filter((entry) => typeof entry.name === 'string' && entry.name && !entry.name.startsWith('.'))
       .sort((a, b) => a.name.localeCompare(b.name));
 
     el.dirEntriesList.innerHTML = '';
@@ -1582,6 +1589,7 @@ async function openDirectoryBrowser(dirPath) {
       el.dirEntriesList.appendChild(row);
     }
   } catch (err) {
+    if (request !== state.directoryRequest || agentId !== state.selectedAgentId) return;
     el.dirEntriesList.innerHTML = `<div style="padding:12px;color:var(--danger)">无法读取目录: ${escapeHtml(err.message)}</div>`;
   }
 }
