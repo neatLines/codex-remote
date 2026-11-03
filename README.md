@@ -176,3 +176,7 @@ DSH 入口为 `/dsh/<agentId>/`，需 Remote 登录、目标设备在线并受�
 ## 本地配置与版本控制
 
 仓库只包含源码、测试、文档和无凭据的 `.env.example`。真实 `.env`、`data/`、`certs/`、私钥、运行日志及工具私有目录已由 `.gitignore` 排除。部署时自行配置域名、路径和证书；不要强制添加这些本地文件。第三方 Markdown 组件及其许可证保留在 `src/public/vendor/`。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)，Copyright (c) 2026 neatLines。第三方组件保留各自的版权声明和许可证，见 `src/public/vendor/`。

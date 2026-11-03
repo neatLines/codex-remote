@@ -2,6 +2,7 @@
   "name": "codex-remote",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Mobile Web Remote Control for local Codex App-Server with TOTP 2FA and E2E HMAC verification",
   "engines": {
