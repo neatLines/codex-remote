@@ -572,6 +572,8 @@ export function startLocalAgent(options = {}) {
         const threadRes = await sendInternalRpc('thread/list', {
           limit: payload.params?.limit ?? 100,
           cursor: payload.params?.cursor || undefined,
+          sortKey: 'updated_at',
+          sortDirection: 'desc',
           useStateDbOnly: true,
           modelProviders: [],
           sourceKinds: ['cli', 'vscode', 'appServer', 'exec', 'unknown'],
@@ -672,6 +674,7 @@ export function startLocalAgent(options = {}) {
               result: {
                 projects: mergedProjects,
                 threads,
+                threadSortKey: 'updated_at',
                 nextCursor: threadRes?.nextCursor || null,
                 defaultCwd,
                 profile: currentProfile,

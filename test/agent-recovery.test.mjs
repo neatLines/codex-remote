@@ -112,6 +112,9 @@ test('internal and forwarded RPC timeouts settle; a crashing child clears stale 
     assert.ok(Array.isArray(workspaces.result.projects));
     const page = await client.rpc('remote/getWorkspacesAndThreads', { cursor: workspaces.result.nextCursor });
     assert.equal(page.result.threads[0].id, 'fixture-page-2');
+    assert.equal(workspaces.result.threadSortKey, 'updated_at');
+    assert.ok(fs.readFileSync(path.join(env.directory, 'fake-codex.log'), 'utf8').split('\n')
+      .filter((line) => line.endsWith('thread-list updated_at desc')).length >= 2);
   } finally { await env.close(); }
 });
 

@@ -115,6 +115,11 @@ const state = {
   restoreAgentId: null,
   threadsNextCursor: null,
   loadingThreads: false,
+  threadsRequest: 0,
+  legacyThreadAgents: new Set(),
+  threadsLoadedAt: 0,
+  refreshTimer: null,
+  refreshing: false,
   threadViews: new Map(),
   currentView: null,
   collapsedWorkspaces: new Set(),
@@ -344,12 +349,12 @@ function applyAgentState(snapshot, agentId) {
     if (view.agentId !== agentId) continue;
     view.syncError = null;
     const turn = running.get(view.threadId);
-    if (previous && (previous.epoch !== snapshot.epoch || snapshot.status === 'error') && view.activeTurnId) {
+    if (previous && (previous.epoch !== snapshot.epoch || snapshot.status === 'error') && view.activeTurnId && view.statusSource === 'local') {
       view.runStatus = snapshot.status === 'error' ? 'failed' : 'interrupted';
       appendSystemNotice('本机 Codex 已重启，原任务已中断；历史已保留，请确认状态后继续。', view);
     }
-    view.activeTurnId = turn?.turnId || (turn ? 'active' : null);
-    if (turn) { view.runStatus = turn.status || 'running'; view.retryMessage = turn.message || ''; }
+    if (turn || view.statusSource === 'local') view.activeTurnId = turn?.turnId || (turn ? 'active' : null);
+    if (turn) { view.statusSource = 'local'; view.statusTurnId = turn.turnId; view.runStatus = turn.status || 'running'; view.retryMessage = turn.message || ''; }
     view.statusRevision++;
     if (snapshot.status === 'error') view.syncError = snapshot.error || '本机 Codex 正在恢复';
     for (const [id, request] of view.approvals) {
@@ -358,7 +363,7 @@ function applyAgentState(snapshot, agentId) {
   }
   for (const turn of running.values()) {
     const view = getThreadView(turn.threadId, agentId);
-    view.activeTurnId = turn.turnId || 'active'; view.runStatus = turn.status || 'running';
+    view.statusSource = 'local'; view.statusTurnId = turn.turnId; view.activeTurnId = turn.turnId || 'active'; view.runStatus = turn.status || 'running';
   }
   for (const request of snapshot.requests) {
     const threadId = request.params?.threadId || request.params?.thread_id || null;
@@ -491,23 +496,53 @@ function handleAgentsList(agents) {
   syncThreadControls();
 }
 
-async function loadWorkspacesAndThreads({ more = false } = {}) {
+async function loadWorkspacesAndThreads({ more = false, background = false } = {}) {
   const agentId = state.selectedAgentId;
   if (more && (!state.threadsNextCursor || state.loadingThreads)) return;
+  if (background && state.loadingThreads) return;
+  const request = ++state.threadsRequest;
   state.loadingThreads = true;
   el.btnMoreThreads.disabled = true;
   try {
     const res = await sendCodexRpc('remote/getWorkspacesAndThreads', {
-      limit: 100, cursor: more ? state.threadsNextCursor : undefined,
+      // A sorted cursor must never go to an old Agent's creation-order query.
+      limit: 100, cursor: more && !state.legacyThreadAgents.has(agentId) ? state.threadsNextCursor : undefined,
     }, agentId);
-    if (agentId !== state.selectedAgentId) return;
-    const projects = new Map((more ? state.projects : []).map((project) => [project.id, project]));
+    if (agentId !== state.selectedAgentId || request !== state.threadsRequest) return;
+    // Older Agents use creation order. Read the sorted page directly without
+    // requiring a restart that would interrupt their running tasks.
+    if (res.threadSortKey !== 'updated_at') {
+      state.legacyThreadAgents.add(agentId);
+      const recent = await sendCodexRpc('thread/list', {
+        limit: 100, cursor: more ? state.threadsNextCursor : undefined,
+        sortKey: 'updated_at', sortDirection: 'desc', useStateDbOnly: true,
+        modelProviders: [], sourceKinds: ['cli', 'vscode', 'appServer', 'exec', 'unknown'],
+      }, agentId);
+      if (agentId !== state.selectedAgentId || request !== state.threadsRequest) return;
+      const assignments = new Map((res.threads || []).map((thread) => [thread.id, thread.projectId]));
+      res.projects ||= [];
+      res.threads = recent.data || [];
+      res.nextCursor = recent.nextCursor;
+      for (const thread of res.threads) {
+        thread.projectId ||= assignments.get(thread.id);
+        if (!thread.projectId && thread.cwd) {
+          let project = res.projects.find((entry) => entry.rootPaths?.includes(thread.cwd));
+          if (!project) {
+            project = { id: `cwd:${thread.cwd}`, name: thread.cwd.split('/').filter(Boolean).pop() || thread.cwd, rootPaths: [thread.cwd] };
+            res.projects.push(project);
+          }
+          thread.projectId = project.id;
+        }
+      }
+    } else state.legacyThreadAgents.delete(agentId);
+    const projects = new Map((more || background ? state.projects : []).map((project) => [project.id, project]));
     for (const project of res.projects || []) projects.set(project.id, project);
     state.projects = [...projects.values()];
-    const threads = new Map((more ? state.threads : []).map((thread) => [thread.id, thread]));
+    const threads = new Map((more || background ? state.threads : []).map((thread) => [thread.id, thread]));
     for (const thread of res.threads || []) threads.set(thread.id, thread);
     state.threads = [...threads.values()];
-    state.threadsNextCursor = res.nextCursor || null;
+    if (!background) state.threadsNextCursor = res.nextCursor || null;
+    state.threadsLoadedAt = Date.now();
     el.btnMoreThreads.classList.toggle('hidden', !state.threadsNextCursor);
     if (Array.isArray(res.models) && res.models.length > 0) {
       state.models = res.models;
@@ -532,9 +567,9 @@ async function loadWorkspacesAndThreads({ more = false } = {}) {
       if (saved) openExistingThread(state.threads.find((thread) => thread.id === saved) || { id: saved });
     }
   } catch (err) {
-    if (agentId === state.selectedAgentId) appendSystemNotice(`加载会话列表失败：${err.message}`);
+    if (!background && agentId === state.selectedAgentId && request === state.threadsRequest) appendSystemNotice(`加载会话列表失败：${err.message}`);
   } finally {
-    if (agentId === state.selectedAgentId) { state.loadingThreads = false; el.btnMoreThreads.disabled = false; }
+    if (agentId === state.selectedAgentId && request === state.threadsRequest) { state.loadingThreads = false; el.btnMoreThreads.disabled = false; }
   }
 }
 
@@ -618,6 +653,11 @@ function renderQuickWorkspaces() {
   }
 }
 
+function threadUpdatedAt(thread) {
+  const value = Number(thread.updatedAt || thread.createdAt) || 0;
+  return value < 1e12 ? value * 1000 : value;
+}
+
 function renderWorkspacesDrawer() {
   const q = (el.threadSearchInput.value || '').trim().toLowerCase();
   el.workspacesContainer.innerHTML = '';
@@ -654,13 +694,17 @@ function renderWorkspacesDrawer() {
     });
   }
 
-  for (const [gid, { project, threads }] of groups.entries()) {
+  for (const group of groups.values()) group.threads.sort((a, b) => threadUpdatedAt(b) - threadUpdatedAt(a));
+  const orderedGroups = [...groups.entries()].sort((a, b) =>
+    threadUpdatedAt(b[1].threads[0] || {}) - threadUpdatedAt(a[1].threads[0] || {}));
+  for (const [gid, { project, threads }] of orderedGroups) {
     if (q && threads.length === 0) continue;
     const isCollapsed = state.collapsedWorkspaces.has(gid) && !q;
     const primaryRoot = project.rootPaths?.[0] || threads[0]?.cwd || '';
 
     const groupEl = document.createElement('div');
     groupEl.className = 'workspace-group';
+    groupEl.dataset.projectId = gid;
 
     const headerEl = document.createElement('div');
     headerEl.className = 'workspace-header';
@@ -700,7 +744,7 @@ function renderWorkspacesDrawer() {
         itemEl.className = `thread-item ${t.id === state.currentThreadId ? 'active' : ''}`;
         itemEl.dataset.threadId = t.id || '';
         const displayTitle = (t.name || t.preview || '新对话').replace(/\s+/g, ' ').slice(0, 60);
-        const dateStr = t.updatedAt ? formatRelativeTime(t.updatedAt * 1000) : '';
+        const dateStr = threadUpdatedAt(t) ? formatRelativeTime(threadUpdatedAt(t)) : '';
         const modelInfo = [t.model || t.modelProvider || '', t.reasoningEffort || '']
           .filter(Boolean)
           .join(' · ');
@@ -736,7 +780,8 @@ function createThreadView(threadId = null, agentId = state.selectedAgentId) {
   return {
     threadId, agentId, messages, itemElements: new Map(), optimisticUserBubbles: [],
     activeTurnId: null, sending: false, approvals: new Map(), revision: 0,
-    interactionCards: new Map(), runStatus: null, retryMessage: '', syncError: null,
+    interactionCards: new Map(), runStatus: null, statusSource: null, statusTurnId: null, statusLoading: false,
+    retryMessage: '', syncError: null, historySyncError: null,
     asyncQuestions: new Map(), answeredAsyncQuestions: new Set(),
     followOutput: true, scrollTop: 0, historyOrder: [], historyCursor: null, historyAnchor: null,
     historyLoading: false, historyLoadedAt: 0, historyVersions: new Map(),
@@ -804,9 +849,9 @@ function syncThreadControls() {
   el.modelSelect.disabled = Boolean(view?.activeTurnId);
   el.effortSelect.disabled = Boolean(view?.activeTurnId);
   const terminal = { failed: '执行失败', interrupted: '任务已停止', completed: '本轮已完成' };
-  el.threadStatus.textContent = view?.syncError || (view?.sending ? '正在提交消息…' : currentRequests ?
+  el.threadStatus.textContent = view?.syncError || view?.historySyncError || (view?.sending ? '正在提交消息…' : currentRequests ?
     `有 ${currentRequests} 项等待你的操作` : view?.runStatus === 'retrying' ? `正在重连，任务仍在重试：${view.retryMessage || ''}` :
-    view?.activeTurnId ? '正在执行…' : terminal[view?.runStatus] || '');
+    view?.activeTurnId ? '正在执行…' : view?.runStatus === 'external' ? '外部会话 · 每 8 秒同步消息，运行状态以原端为准' : terminal[view?.runStatus] || '');
   el.threadStatus.classList.toggle('hidden', !el.threadStatus.textContent);
   el.btnLoadHistory.classList.toggle('hidden', !view?.historyCursor);
   el.btnLoadHistory.disabled = Boolean(view?.historyLoading);
@@ -847,6 +892,8 @@ async function openExistingThread(threadSummary) {
 }
 
 async function loadThreadStatus(view, request) {
+  if (view.statusLoading) return;
+  view.statusLoading = true;
   const statusRevision = view.statusRevision;
   try {
     const response = await sendCodexRpc('thread/turns/list', {
@@ -855,13 +902,20 @@ async function loadThreadStatus(view, request) {
     if (request !== view.historyRequest || view.statusRevision !== statusRevision) return;
     const latest = response?.data?.[0];
     if (!latest) return;
-    view.activeTurnId = latest.status === 'inProgress' ? latest.id : null;
-    view.runStatus = latest.status === 'inProgress' ? 'running' : latest.status;
+    // A separate app-server reconstructs an external open turn as interrupted.
+    // Persisted history cannot establish runtime ownership or a stopped task.
+    if (view.statusSource === 'local' && (view.activeTurnId || (view.statusTurnId === latest.id &&
+        ['completed', 'failed', 'interrupted'].includes(view.runStatus)))) return;
+    view.statusSource = 'history';
+    view.statusTurnId = latest.id;
+    view.activeTurnId = null;
+    view.runStatus = ['interrupted', 'inProgress'].includes(latest.status) ? 'external' : latest.status;
     if (state.currentView === view) syncThreadControls();
   } catch { /* History remains readable; Agent snapshots also restore execution state. */ }
+  finally { view.statusLoading = false; }
 }
 
-async function loadThreadHistory(view, { older = false } = {}) {
+async function loadThreadHistory(view, { older = false, background = false } = {}) {
   if (view.historyLoading || (older && !view.historyCursor)) return;
   const request = ++view.historyRequest;
   const revision = view.revision;
@@ -878,6 +932,7 @@ async function loadThreadHistory(view, { older = false } = {}) {
     if (!older) void loadThreadStatus(view, request);
     const response = await pending;
     if (request !== view.historyRequest) return;
+    view.historySyncError = null;
     const entries = (response?.data || []).slice().reverse();
     const items = entries.map((entry) => entry.item || entry).filter(Boolean);
     const overlapsHistory = items.some((item) => view.historyVersions.has(item.id));
@@ -924,11 +979,36 @@ async function loadThreadHistory(view, { older = false } = {}) {
       else scrollToBottom();
     }
   } catch (err) {
-    if (request === view.historyRequest) appendSystemNotice(`加载会话失败: ${err.message}`, view);
+    if (request === view.historyRequest) {
+      if (background) view.historySyncError = '消息同步暂时失败，将自动重试';
+      else appendSystemNotice(`加载会话失败: ${err.message}`, view);
+    }
   } finally {
     if (request === view.historyRequest) view.historyLoading = false;
     if (state.currentView === view) syncThreadControls();
   }
+}
+
+async function refreshVisibleThread() {
+  const agent = getSelectedAgent();
+  if (state.refreshing || document.visibilityState === 'hidden' || state.ws?.readyState !== WebSocket.OPEN ||
+      !agent?.online || !agent.trusted) return;
+  state.refreshing = true;
+  try {
+    const view = state.currentView;
+    const jobs = [];
+    if (view?.threadId && view.agentId === agent.agentId && !view.sending) jobs.push(loadThreadHistory(view, { background: true }));
+    if (Date.now() - state.threadsLoadedAt >= 30000) jobs.push(loadWorkspacesAndThreads({ background: true }));
+    await Promise.all(jobs);
+  } finally { state.refreshing = false; }
+}
+
+function scheduleHistoryRefresh() {
+  clearTimeout(state.refreshTimer);
+  state.refreshTimer = setTimeout(async () => {
+    try { await refreshVisibleThread(); }
+    finally { scheduleHistoryRefresh(); }
+  }, 8000);
 }
 
 function handleIncomingCodexPayload(payload, agentId = state.selectedAgentId) {
@@ -977,16 +1057,19 @@ function handleIncomingCodexPayload(payload, agentId = state.selectedAgentId) {
   if (!params.threadId) return;
   const view = getThreadView(params.threadId, agentId);
   if (method === 'turn/started') {
+    view.statusSource = 'local'; view.statusTurnId = params.turn?.id || params.turnId || null;
     view.statusRevision++;
     view.activeTurnId = params.turn?.id || params.turnId || 'active';
     view.runStatus = 'running'; view.retryMessage = '';
   } else if (method === 'turn/completed') {
+    view.statusSource = 'local'; view.statusTurnId = params.turn?.id || params.turnId || view.activeTurnId;
     view.statusRevision++;
     view.activeTurnId = null;
     view.runStatus = params.turn?.status === 'failed' ? 'failed' : params.turn?.status === 'interrupted' ? 'interrupted' : 'completed';
     for (const id of view.approvals.keys()) resolveInteraction(view, id, '本轮已结束');
     if (params.turn?.error) appendSystemNotice(`执行失败: ${params.turn.error.message || '未知错误'}`, view);
   } else if (method === 'thread/status/changed') {
+    view.statusSource = 'local';
     view.statusRevision++;
     const status = params.status?.type;
     if (['idle', 'notLoaded', 'systemError'].includes(status)) view.activeTurnId = null;
@@ -1104,6 +1187,7 @@ async function submitAsyncQuestion(view, id, question, response) {
       ? await sendCodexRpc('turn/steer', { ...params, expectedTurnId: turnId }, view.agentId)
       : await sendCodexRpc('turn/start', params, view.agentId);
     if (!turnId && view.statusRevision === statusRevision && result?.turn) {
+      view.statusSource = 'local'; view.statusTurnId = result.turn.id;
       const terminal = ['completed', 'failed', 'interrupted'].includes(result.turn.status);
       view.activeTurnId = terminal ? null : result.turn.id;
       view.runStatus = terminal ? result.turn.status : 'running';
@@ -1413,6 +1497,7 @@ async function sendUserPrompt() {
       }
     }
     if (!continuing && view.statusRevision === statusRevision) {
+      view.statusSource = 'local'; view.statusTurnId = result?.turn?.id || null;
       const terminalStatus = ['completed', 'failed', 'interrupted'].includes(result?.turn?.status);
       view.activeTurnId = terminalStatus ? null : result?.turn?.id || view.activeTurnId;
       view.runStatus = terminalStatus ? result.turn.status : 'running';
@@ -1779,6 +1864,10 @@ function resumeLoginDestination() {
 // === Bootstrap ===
 (async function init() {
   setupVisualViewportFix();
+  scheduleHistoryRefresh();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'hidden') void refreshVisibleThread();
+  });
   renderModelAndEffortSelectors();
   try {
     const res = await fetch('/api/auth/status');

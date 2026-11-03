@@ -82,7 +82,7 @@ function setup(options = {}) {
   const sent = [];
   const storage = new Map();
   const context = vm.createContext({
-    document: { getElementById(id) {
+    document: { visibilityState: 'visible', getElementById(id) {
       if (!nodes.has(id)) nodes.set(id, new Element());
       return nodes.get(id);
     }, createElement: (tag) => new Element(false, tag), createDocumentFragment: () => new Element(true), body: new Element() },
@@ -98,13 +98,16 @@ function setup(options = {}) {
   const interactions = fs.readFileSync(new URL('../src/public/interactions.js', import.meta.url), 'utf8')
     .replace(/^import .*;$/gm, '').replace(/^export /gm, '');
   source = interactions + '\n' + source;
-  vm.runInContext(source + '\nglobalThis.app = { state, el, getThreadView, createThreadView, activateThreadView, openExistingThread, startNewThreadInWorkspace, sendUserPrompt, handleIncomingCodexPayload, rejectPendingRpc, syncThreadControls, applyAgentState, submitInteraction, loadThreadHistory, loadWorkspacesAndThreads, renderThreadItem, syncAgentState, renderWorkspacesDrawer, loadCloudFiles };', context);
+  vm.runInContext(source + '\nglobalThis.app = { state, el, getThreadView, createThreadView, activateThreadView, openExistingThread, startNewThreadInWorkspace, sendUserPrompt, handleIncomingCodexPayload, rejectPendingRpc, syncThreadControls, applyAgentState, submitInteraction, loadThreadHistory, loadWorkspacesAndThreads, renderThreadItem, syncAgentState, renderWorkspacesDrawer, loadCloudFiles, refreshVisibleThread, scheduleHistoryRefresh, document };', context);
   const app = context.app;
   app.state.selectedAgentId = 'agent';
   app.state.agents = [{ agentId: 'agent', online: true, trusted: true }];
   app.state.ws = { readyState: 1, send: (data) => sent.push(JSON.parse(data)) };
   app.activateThreadView(app.getThreadView('A'));
-  const respond = (request, result, error) => app.handleIncomingCodexPayload({ id: request.payload.id, result, error }, request.agentId);
+  const respond = (request, result, error) => {
+    if (result && request.payload.method === 'remote/getWorkspacesAndThreads') result = { threadSortKey: 'updated_at', ...result };
+    app.handleIncomingCodexPayload({ id: request.payload.id, result, error }, request.agentId);
+  };
   const notify = (method, params) => app.handleIncomingCodexPayload({ method, params }, 'agent');
   return { ...app, sent, respond, notify, timers, storage };
 }
@@ -247,16 +250,17 @@ test('timeouts and disconnected RPCs settle instead of hanging indefinitely', as
   }
 });
 
-test('historical in-progress turns restore the stop control', async () => {
+test('external in-progress history does not expose local stop or steer controls', async () => {
   const app = setup();
   const load = app.openExistingThread({ id: 'A' });
   app.respond(app.sent[0], history('running', [user('u', 'task')]));
   app.respond(app.sent[1], { data: [{ id: 'running', status: 'inProgress', items: [] }] });
   await load;
-  assert.equal(app.state.activeTurnId, 'running');
-  assert.equal(app.el.btnStopTurn.classList.contains('hidden'), false);
+  assert.equal(app.state.activeTurnId, null);
+  assert.equal(app.el.btnStopTurn.classList.contains('hidden'), true);
   assert.equal(app.el.btnSend.disabled, false);
-  assert.equal(app.el.btnSend.textContent, '追加');
+  assert.equal(app.el.btnSend.textContent, '发送');
+  assert.match(app.el.threadStatus.textContent, /外部会话/);
 });
 
 test('old identical prompts cannot consume a new optimistic message', async () => {
@@ -792,6 +796,7 @@ test('paging older question receipts and refreshing latest preserves the oldest 
 test('history can fill a gap after a long disconnect without reversing already cached messages', async () => {
   const app = setup(), view = app.state.currentView;
   let loading = app.loadThreadHistory(view);
+  app.respond(app.sent[1], { data: [] });
   app.respond(app.sent[0], history('turn', [agent('old', 'old')])); await loading;
   loading = app.loadThreadHistory(view);
   app.respond(app.sent[2], history('turn', [agent('new', 'new')], 'gap')); await loading;
@@ -836,4 +841,144 @@ test('cloud file refresh ignores stale replies and reports expired login without
   assert.match(app.el.filesStatus.textContent, /登录已过期/);
   assert.equal(app.state.currentView, current);
   assert.equal(app.state.files.loading, false);
+});
+
+test('polling reads external messages without live events and does not infer stopped from history', async () => {
+  const app = setup(), view = app.state.currentView;
+  app.state.threadsLoadedAt = Date.now();
+  const first = app.refreshVisibleThread();
+  app.respond(app.sent[0], history('external', [user('u', 'task'), agent('answer', 'first')]));
+  app.respond(app.sent[1], { data: [{ id: 'external', status: 'interrupted' }] });
+  await first;
+  assert.match(app.el.threadStatus.textContent, /外部会话/);
+  assert.doesNotMatch(app.el.threadStatus.textContent, /任务已停止/);
+  const bubble = view.itemElements.get('answer');
+  app.applyAgentState({ epoch: 'first', revision: 1, requests: [], activeTurns: [] }, 'agent');
+  app.applyAgentState({ epoch: 'second', revision: 1, requests: [], activeTurns: [] }, 'agent');
+  assert.doesNotMatch(view.messages.textContent, /已重启/);
+  const second = app.refreshVisibleThread();
+  app.respond(app.sent[2], history('external', [user('u', 'task'), agent('answer', 'first, updated'), agent('next', 'new message')]));
+  app.respond(app.sent[3], { data: [{ id: 'external', status: 'completed' }] });
+  await second;
+  assert.equal(view.itemElements.get('answer'), bubble);
+  assert.match(view.messages.textContent, /first, updatednew message/);
+  assert.equal(app.el.threadStatus.textContent, '本轮已完成');
+});
+
+test('polling pauses when hidden or offline, avoids overlaps and preserves the captured thread after navigation', async () => {
+  const app = setup(), a = app.state.currentView;
+  app.state.threadsLoadedAt = Date.now();
+  app.document.visibilityState = 'hidden';
+  await app.refreshVisibleThread();
+  assert.equal(app.sent.length, 0);
+  app.document.visibilityState = 'visible';
+  app.state.agents[0].online = false;
+  await app.refreshVisibleThread();
+  assert.equal(app.sent.length, 0);
+  app.state.agents[0].online = true;
+  const polling = app.refreshVisibleThread();
+  await app.refreshVisibleThread();
+  assert.equal(app.sent.length, 2);
+  const b = app.getThreadView('B');
+  app.activateThreadView(b);
+  app.el.promptInput.value = 'draft';
+  app.respond(app.sent[0], history('external', [agent('a', 'A update')]));
+  app.respond(app.sent[1], { data: [] });
+  await polling;
+  assert.equal(a.messages.textContent, 'A update');
+  assert.equal(b.messages.textContent, '');
+  assert.equal(app.el.promptInput.value, 'draft');
+  const retry = app.refreshVisibleThread();
+  app.respond(app.sent[2], undefined, { message: 'temporary' });
+  app.respond(app.sent[3], { data: [] });
+  await retry;
+  assert.equal(b.messages.textContent, '');
+  assert.match(app.el.threadStatus.textContent, /自动重试/);
+  const recovery = app.refreshVisibleThread();
+  app.respond(app.sent[4], history('b', [agent('b', 'B recovered')]));
+  app.respond(app.sent[5], { data: [] });
+  await recovery;
+  assert.equal(b.historySyncError, null);
+  assert.equal(b.messages.textContent, 'B recovered');
+});
+
+test('scheduled polling reschedules after errors and cannot erase a locally confirmed running turn', async () => {
+  const app = setup();
+  app.state.threadsLoadedAt = Date.now();
+  app.notify('turn/started', { threadId: 'A', turn: { id: 'local' } });
+  app.scheduleHistoryRefresh();
+  const timer = app.state.refreshTimer;
+  const polling = app.timers.get(timer)();
+  app.respond(app.sent[0], undefined, { message: 'temporary' });
+  app.respond(app.sent[1], { data: [{ id: 'old', status: 'interrupted' }] });
+  await polling;
+  assert.notEqual(app.state.refreshTimer, timer);
+  assert.equal(app.state.activeTurnId, 'local');
+  assert.equal(app.el.btnStopTurn.classList.contains('hidden'), false);
+});
+
+test('sidebar groups and threads follow recent updates and background refresh retains older pages', async () => {
+  const app = setup();
+  app.state.projects = [{ id: 'p', name: 'P' }, { id: 'q', name: 'Q' }];
+  app.state.threads = [
+    { id: 'old', projectId: 'p', updatedAt: 10 },
+    { id: 'new', projectId: 'p', updatedAt: 30 },
+    { id: 'middle', projectId: 'q', updatedAt: 20 },
+  ];
+  app.state.threadsNextCursor = 'older-page';
+  app.renderWorkspacesDrawer();
+  const order = () => app.el.workspacesContainer.querySelectorAll('.thread-item').map((node) => node.dataset.threadId);
+  assert.deepEqual(order(), ['new', 'old', 'middle']);
+  const loading = app.loadWorkspacesAndThreads({ background: true });
+  app.respond(app.sent[0], { projects: [], threads: [{ id: 'middle', projectId: 'q', updatedAt: 40 }], nextCursor: 'first-page-cursor' });
+  await loading;
+  assert.deepEqual(order(), ['middle', 'new', 'old']);
+  assert.equal(app.state.threadsNextCursor, 'older-page');
+  assert.equal(app.state.threads.length, 3);
+});
+
+test('older Agents use a native sorted query, including pagination and workspace discovery', async () => {
+  const app = setup();
+  const first = app.loadWorkspacesAndThreads();
+  app.respond(app.sent[0], { threadSortKey: null, projects: [], threads: [{ id: 'created-recently' }] });
+  await tick();
+  const sorted = app.sent[1];
+  assert.equal(sorted.payload.method, 'thread/list');
+  assert.equal(sorted.payload.params.sortKey, 'updated_at');
+  assert.equal(sorted.payload.params.sortDirection, 'desc');
+  app.respond(sorted, { data: [{ id: 'old-but-used-today', cwd: '/work/project', updatedAt: 100 }], nextCursor: 'sorted-next' });
+  await first;
+  assert.equal(app.state.threads[0].id, 'old-but-used-today');
+  assert.equal(app.state.threads[0].projectId, 'cwd:/work/project');
+  const second = app.loadWorkspacesAndThreads({ more: true });
+  assert.equal(app.sent[2].payload.params.cursor, undefined, 'legacy composite queries must not receive a cursor from another sort order');
+  app.respond(app.sent[2], { threadSortKey: null, projects: [], threads: [] });
+  await tick();
+  assert.equal(app.sent[3].payload.params.cursor, 'sorted-next');
+  app.respond(app.sent[3], { data: [], nextCursor: null });
+  await second;
+  assert.equal(app.state.threads.length, 1);
+});
+
+test('polling can recover a missed local completion after the Agent snapshot clears the active turn', async () => {
+  const app = setup(), view = app.state.currentView;
+  app.applyAgentState({ epoch: 'same', revision: 1, requests: [], activeTurns: [{ threadId: 'A', turnId: 'local' }] }, 'agent');
+  app.applyAgentState({ epoch: 'same', revision: 2, requests: [], activeTurns: [] }, 'agent');
+  const loading = app.loadThreadHistory(view);
+  app.respond(app.sent[0], history('local', [agent('answer', 'done')]));
+  app.respond(app.sent[1], { data: [{ id: 'local', status: 'completed' }] });
+  await loading;
+  assert.equal(app.el.threadStatus.textContent, '本轮已完成');
+});
+
+test('stale list replies cannot replace a newer manual refresh', async () => {
+  const app = setup();
+  const background = app.loadWorkspacesAndThreads({ background: true });
+  const manual = app.loadWorkspacesAndThreads();
+  app.respond(app.sent[1], { threads: [{ id: 'latest', updatedAt: 20 }] });
+  await manual;
+  app.respond(app.sent[0], { threads: [{ id: 'stale', updatedAt: 10 }] });
+  await background;
+  assert.equal(app.state.threads[0].id, 'latest');
+  assert.equal(app.state.loadingThreads, false);
 });

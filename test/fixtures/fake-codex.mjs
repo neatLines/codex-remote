@@ -28,6 +28,7 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
   else if (request.method === 'config/read') reply({ config: { model: 'fixture-model' } });
   else if (request.method === 'model/list') reply({ data: [] });
   else if (request.method === 'thread/list') {
+    log(`thread-list ${request.params?.sortKey} ${request.params?.sortDirection}`);
     if (request.params?.limit === 999) return;
     reply({ data: [{ id: request.params?.cursor ? 'fixture-page-2' : threadId, cwd: process.cwd(), preview: 'Fixture thread' }],
       nextCursor: request.params?.cursor ? null : 'fixture-next-page' });
