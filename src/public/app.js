@@ -102,6 +102,8 @@ const state = {
   pendingRpc: new Map(),
   agents: [],
   selectedAgentId: localStorage.getItem('codex_selected_agent') || null,
+  selectedApp: null,
+  runtimeDeviceId: null,
   projects: [],
   threads: [],
   models: [],
@@ -158,7 +160,15 @@ const el = {
   currentWorkspaceBadge: document.getElementById('current-workspace-badge'),
   wsStatusDot: document.getElementById('ws-status-dot'),
   btnE2EKey: document.getElementById('btn-e2e-key'),
-  btnDshWeb: document.getElementById('btn-dsh-web'),
+  btnDeviceApps: document.getElementById('btn-device-apps'),
+  deviceApps: document.getElementById('device-apps'),
+  deviceAppsTitle: document.getElementById('device-apps-title'),
+  deviceAppsStatus: document.getElementById('device-apps-status'),
+  appCards: document.getElementById('app-cards'),
+  codexComposer: document.getElementById('codex-composer'),
+  codexActions: document.getElementById('codex-actions'),
+  codexSearch: document.getElementById('codex-search'),
+  codexQuickActions: document.getElementById('codex-quick-actions'),
   btnNewThread: document.getElementById('btn-new-thread'),
   btnFiles: document.getElementById('btn-files'),
   modalFiles: document.getElementById('modal-files'),
@@ -212,7 +222,69 @@ function getSelectedAgent() {
   return state.agents.find((a) => a.agentId === state.selectedAgentId) || null;
 }
 
+function renderDeviceApps() {
+  const agent = getSelectedAgent();
+  const apps = [
+    ...(agent && agent.codexEnabled !== false ? [{ id: 'codex', name: 'Codex', status: agent.codexStatus || 'ready' }] : []),
+    ...(agent?.dshWeb?.enabled ? [{ id: 'dsh', name: 'DSH', status: agent.dshWeb.status }] : []),
+    ...(agent?.opencodeWeb?.enabled ? [{ id: 'opencode', name: 'OpenCode', status: agent.opencodeWeb.status }] : []),
+  ];
+  if (state.runtimeDeviceId !== agent?.agentId) {
+    state.runtimeDeviceId = agent?.agentId;
+    state.selectedApp = null;
+  }
+  if (!apps.some((app) => app.id === state.selectedApp)) state.selectedApp = null;
+  el.appCards.replaceChildren();
+  for (const app of apps) {
+    const ready = agent.online && agent.trusted && app.status === 'ready';
+    const card = document.createElement(app.id === 'codex' || !ready ? 'button' : 'a');
+    card.className = 'app-card'; card.dataset.app = app.id;
+    if (card.tagName === 'BUTTON') {
+      card.type = 'button'; card.disabled = !ready;
+      card.onclick = () => selectDeviceApp('codex');
+    } else {
+      card.href = `/${app.id}/${encodeURIComponent(agent.agentId)}/`;
+      card.target = '_blank'; card.rel = 'noopener noreferrer';
+    }
+    const name = document.createElement('strong'); name.textContent = app.name;
+    const status = document.createElement('span'); status.className = 'app-status';
+    status.textContent = !agent.online ? '设备离线' : !agent.trusted ? '等待信任设备' :
+      app.status === 'ready' ? '运行中' : app.status === 'error' ? '连接异常，正在重试' : '启动中…';
+    const action = document.createElement('span'); action.className = 'app-action';
+    action.textContent = ready ? (app.id === 'codex' ? '进入会话 →' : '打开原生页面 ↗') : '暂不可用';
+    card.appendChild(name); card.appendChild(status); card.appendChild(action);
+    el.appCards.appendChild(card);
+  }
+  const launcher = state.selectedApp !== 'codex';
+  el.deviceApps.classList.toggle('hidden', !launcher);
+  el.btnDeviceApps.classList.toggle('hidden', launcher);
+  for (const element of [el.chatContainer, el.codexComposer, el.codexActions, el.codexSearch,
+    el.workspacesContainer, el.codexQuickActions, el.btnNewThread, el.btnE2EKey]) element.classList.toggle('hidden', launcher);
+  el.btnMoreThreads.classList.toggle('hidden', launcher || !state.threadsNextCursor);
+  el.deviceAppsTitle.textContent = agent?.name || '等待设备连接';
+  el.deviceAppsStatus.textContent = !agent ? '在电脑或服务器上运行 codex-up，即可在这里选择设备。' :
+    !agent.online ? '设备离线。重新连接后，可继续打开它的应用。' :
+    !agent.trusted ? '请先信任并绑定这台设备。' : !apps.length ? '这台设备尚未启用应用。' : '选择这台设备上的应用';
+  if (launcher) {
+    el.currentThreadTitle.textContent = '设备应用';
+    el.currentWorkspaceBadge.textContent = agent?.name || '未选择设备';
+  }
+}
+
+function selectDeviceApp(value) {
+  const agent = getSelectedAgent();
+  if (value && (value !== 'codex' || !agent?.online || !agent.trusted || agent.codexEnabled === false)) return;
+  state.selectedApp = value;
+  updateBanners(); closeDrawer();
+  if (value === 'codex') {
+    const thread = state.threads.find((entry) => entry.id === state.currentThreadId);
+    el.currentThreadTitle.textContent = thread?.name || thread?.preview || '选择或新建会话';
+    updateTopbarWorkspace(); void loadWorkspacesAndThreads(); void syncAgentState();
+  }
+}
+
 function updateBanners() {
+  renderDeviceApps();
   const untrustedOnline = state.agents.filter((a) => a.online && !a.trusted);
   if (untrustedOnline.length > 0) {
     const first = untrustedOnline[0];
@@ -227,11 +299,7 @@ function updateBanners() {
   }
 
   const currentAgent = getSelectedAgent();
-  const dshAvailable = currentAgent?.online && currentAgent.trusted && currentAgent.dshWeb?.enabled;
-  el.btnDshWeb.classList.toggle('hidden', !dshAvailable);
-  el.btnDshWeb.href = currentAgent ? `/dsh/${encodeURIComponent(currentAgent.agentId)}/` : '#';
-  el.btnDshWeb.title = currentAgent?.dshWeb?.status === 'ready' ? '打开 DSH Web' : 'DSH Web 正在启动或重连';
-  if (currentAgent && currentAgent.online && currentAgent.trusted && currentAgent.requiresE2E) {
+  if (state.selectedApp === 'codex' && currentAgent && currentAgent.online && currentAgent.trusted && currentAgent.requiresE2E) {
     const key = getStoredE2EKey(currentAgent.agentId);
     const matchesFingerprint =
       key && (!currentAgent.e2eKeyFingerprint || sha256Hex(key).slice(0, 10) === currentAgent.e2eKeyFingerprint);
@@ -322,6 +390,8 @@ function resolveInteraction(view, requestId, message = '请求已结束', epoch)
 }
 
 async function syncAgentState(agentId = state.selectedAgentId) {
+  if (state.selectedApp !== 'codex') return;
+  if (state.agents.find((agent) => agent.agentId === agentId)?.codexEnabled === false) return;
   if (!agentId) return;
   if (state.agentSyncs.has(agentId)) return state.agentSyncs.get(agentId);
   const operation = (async () => {
@@ -455,7 +525,7 @@ function handleAgentsList(agents) {
   const onlineTrusted = agents.filter((a) => a.online && a.trusted);
   const current = agents.find((a) => a.agentId === state.selectedAgentId);
 
-  if (!current || (!current.online && onlineTrusted.length > 0)) {
+  if (!current) {
     state.selectedAgentId = (onlineTrusted[0] || agents[0])?.agentId || null;
     if (state.selectedAgentId) {
       localStorage.setItem('codex_selected_agent', state.selectedAgentId);
@@ -498,6 +568,7 @@ function handleAgentsList(agents) {
 }
 
 async function loadWorkspacesAndThreads({ more = false, background = false } = {}) {
+  if (getSelectedAgent()?.codexEnabled === false || state.selectedApp !== 'codex') return;
   const agentId = state.selectedAgentId;
   if (more && (!state.threadsNextCursor || state.loadingThreads)) return;
   if (background && state.loadingThreads) return;
@@ -509,7 +580,7 @@ async function loadWorkspacesAndThreads({ more = false, background = false } = {
       // A sorted cursor must never go to an old Agent's creation-order query.
       limit: 100, cursor: more && !state.legacyThreadAgents.has(agentId) ? state.threadsNextCursor : undefined,
     }, agentId);
-    if (agentId !== state.selectedAgentId || request !== state.threadsRequest) return;
+    if (agentId !== state.selectedAgentId || request !== state.threadsRequest || state.selectedApp !== 'codex') return;
     // Older Agents use creation order. Read the sorted page directly without
     // requiring a restart that would interrupt their running tasks.
     if (res.threadSortKey !== 'updated_at') {
@@ -519,7 +590,7 @@ async function loadWorkspacesAndThreads({ more = false, background = false } = {
         sortKey: 'updated_at', sortDirection: 'desc', useStateDbOnly: true,
         modelProviders: [], sourceKinds: ['cli', 'vscode', 'appServer', 'exec', 'unknown'],
       }, agentId);
-      if (agentId !== state.selectedAgentId || request !== state.threadsRequest) return;
+      if (agentId !== state.selectedAgentId || request !== state.threadsRequest || state.selectedApp !== 'codex') return;
       const assignments = new Map((res.threads || []).map((thread) => [thread.id, thread.projectId]));
       res.projects ||= [];
       res.threads = recent.data || [];
@@ -991,6 +1062,7 @@ async function loadThreadHistory(view, { older = false, background = false } = {
 }
 
 async function refreshVisibleThread() {
+  if (state.selectedApp !== 'codex') return;
   const agent = getSelectedAgent();
   if (state.refreshing || document.visibilityState === 'hidden' || state.ws?.readyState !== WebSocket.OPEN ||
       !agent?.online || !agent.trusted) return;
@@ -1733,8 +1805,10 @@ el.agentSelect.onchange = () => {
   el.currentThreadTitle.textContent = '选择或新建会话';
   localStorage.setItem('codex_selected_agent', state.selectedAgentId);
   updateBanners();
-  loadWorkspacesAndThreads();
+  closeDrawer();
 };
+
+el.btnDeviceApps.onclick = () => selectDeviceApp(null);
 
 el.btnRefreshThreads.onclick = () => loadWorkspacesAndThreads();
 el.threadSearchInput.oninput = () => renderWorkspacesDrawer();
@@ -1862,7 +1936,7 @@ function setupVisualViewportFix() {
 
 function resumeLoginDestination() {
   const destination = new URLSearchParams(location.search).get('next');
-  if (destination && /^\/dsh\/[a-zA-Z0-9_-]+\//.test(destination) && !/[\\\r\n]/.test(destination)) {
+  if (destination && /^\/(?:dsh|opencode)\/[a-zA-Z0-9_-]+\//.test(destination) && !/[\\\r\n]/.test(destination)) {
     location.replace(destination);
     return true;
   }

@@ -1,14 +1,15 @@
 import crypto from 'node:crypto';
 import { cleanHeaders, decodeChunk, queueChunk, acknowledge, endStream, MAX_BODY_BYTES } from './dsh-tunnel.mjs';
 
-const ROUTE = /^\/dsh\/([a-zA-Z0-9_-]+)(\/.*)?$/;
-
-export function createDshProxy({ agents, isAuthenticated, isTrusted, publicOrigin }) {
+export function createDshProxy({ agents, isAuthenticated, isTrusted, publicOrigin, service = 'dsh' }) {
+  if (!['dsh', 'opencode'].includes(service)) throw new Error('Unknown web service');
+  const routePattern = new RegExp(`^/${service}/([a-zA-Z0-9_-]+)(/.*)?$`);
+  const label = service === 'dsh' ? 'DSH' : 'OpenCode';
   const tunnels = new Map();
   function route(req) {
     const url = new URL(req.url, 'http://remote.invalid');
-    const match = ROUTE.exec(url.pathname);
-    return match ? { agentId: match[1], prefix: `/dsh/${match[1]}/`, path: `${match[2] || '/'}${url.search}`, slash: Boolean(match[2]) } : null;
+    const match = routePattern.exec(url.pathname);
+    return match ? { agentId: match[1], prefix: `/${service}/${match[1]}/`, path: `${match[2] || '/'}${url.search}`, slash: Boolean(match[2]) } : null;
   }
   function error(target, status, message, websocket = false) {
     if (websocket) { target.end(`HTTP/1.1 ${status} Error\r\nConnection: close\r\n\r\n`); return; }
@@ -31,13 +32,13 @@ export function createDshProxy({ agents, isAuthenticated, isTrusted, publicOrigi
       } else error(target, 401, '请先登录 Codex Remote', websocket);
       return null;
     }
-    if (!trustedOrigin(req)) { error(target, 403, '跨站 DSH 请求被拒绝', websocket); return null; }
+    if (!trustedOrigin(req)) { error(target, 403, `跨站 ${label} 请求被拒绝`, websocket); return null; }
     const agent = agents.get(info.agentId);
     if (!isTrusted(info.agentId)) { error(target, 403, '请先信任目标设备', websocket); return null; }
     if (!agent) { error(target, 503, '目标设备不在线', websocket); return null; }
-    if (!agent.dshWeb?.enabled) { error(target, 503, '目标设备未启用 DSH Web，请重启 codex-up', websocket); return null; }
+    if (!agent[`${service}Web`]?.enabled) { error(target, 503, `目标设备未启用 ${label}，请检查 codex-up 配置`, websocket); return null; }
     if (tunnels.size >= 512 || [...tunnels.values()].filter((entry) => entry.agentId === info.agentId).length >= 128) {
-      error(target, 503, 'DSH 连接过多，请稍后重试', websocket); return null;
+      error(target, 503, `${label} 连接过多，请稍后重试`, websocket); return null;
     }
     return agent;
   }
@@ -55,18 +56,18 @@ export function createDshProxy({ agents, isAuthenticated, isTrusted, publicOrigi
     const id = crypto.randomUUID();
     const entry = { id, agentId: info.agentId, agentWs: agent.ws, target, websocket, source: websocket ? target : req,
       prefix: info.prefix, session: req.headers.cookie, bytes: 0, upgraded: false, head,
-      send: (message) => agent.ws.send(message) };
+      send: (message) => agent.ws.send({ ...message, type: message.type.replace(/^dsh\//, `${service}/`) }) };
     tunnels.set(id, entry);
-    entry.timer = setTimeout(() => fail(entry, 504, 'DSH Web 启动或响应超时'), 120000);
+    entry.timer = setTimeout(() => fail(entry, 504, `${label} Web 启动或响应超时`), 120000);
     entry.timer.unref();
     entry.source.pause();
     entry.source.on('data', (chunk) => {
       if (!tunnels.has(id)) return;
       try {
         entry.bytes += chunk.length;
-        if (!websocket && entry.bytes > MAX_BODY_BYTES) return fail(entry, 413, 'DSH 请求超过 256 MiB');
+        if (!websocket && entry.bytes > MAX_BODY_BYTES) return fail(entry, 413, `${label} 请求超过 256 MiB`);
         queueChunk(entry, chunk);
-      } catch { fail(entry, 502, 'DSH 数据传输失败'); }
+      } catch { fail(entry, 502, `${label} 数据传输失败`); }
     });
     entry.source.on('end', () => { if (tunnels.has(id)) endStream(entry); });
     entry.source.on('error', () => dispose(entry));
@@ -95,7 +96,8 @@ export function createDshProxy({ agents, isAuthenticated, isTrusted, publicOrigi
       return true;
     },
     handleMessage(agentId, ws, message) {
-      if (!message.type?.startsWith('dsh/')) return false;
+      if (!message.type?.startsWith(`${service}/`)) return false;
+      message = { ...message, type: message.type.replace(`${service}/`, 'dsh/') };
       const entry = tunnels.get(message.id);
       if (!entry || entry.agentId !== agentId || entry.agentWs !== ws) return true;
       try {
@@ -126,9 +128,9 @@ export function createDshProxy({ agents, isAuthenticated, isTrusted, publicOrigi
         } else if (message.type === 'dsh/ack') acknowledge(entry);
         else if (message.type === 'dsh/end') {
           entry.target.end(); dispose(entry, false);
-        } else if (message.type === 'dsh/error') fail(entry, 502, 'DSH Web 暂不可用，请检查本机 Agent');
+        } else if (message.type === 'dsh/error') fail(entry, 502, `${label} Web 暂不可用，请检查设备上的 Agent`);
         else if (message.type === 'dsh/close') { entry.target.destroy(); dispose(entry, false); }
-      } catch { fail(entry, 502, 'DSH 代理响应无效'); }
+      } catch { fail(entry, 502, `${label} 代理响应无效`); }
       return true;
     },
     disconnect(ws) {

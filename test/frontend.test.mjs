@@ -98,9 +98,11 @@ function setup(options = {}) {
   const interactions = fs.readFileSync(new URL('../src/public/interactions.js', import.meta.url), 'utf8')
     .replace(/^import .*;$/gm, '').replace(/^export /gm, '');
   source = interactions + '\n' + source;
-  vm.runInContext(source + '\nglobalThis.app = { state, el, getThreadView, createThreadView, activateThreadView, openExistingThread, startNewThreadInWorkspace, sendUserPrompt, handleIncomingCodexPayload, rejectPendingRpc, syncThreadControls, applyAgentState, submitInteraction, loadThreadHistory, loadWorkspacesAndThreads, renderThreadItem, syncAgentState, renderWorkspacesDrawer, loadCloudFiles, refreshVisibleThread, scheduleHistoryRefresh, openDirectoryBrowser, document };', context);
+  vm.runInContext(source + '\nglobalThis.app = { state, el, getThreadView, createThreadView, activateThreadView, openExistingThread, startNewThreadInWorkspace, sendUserPrompt, handleIncomingCodexPayload, rejectPendingRpc, syncThreadControls, applyAgentState, submitInteraction, loadThreadHistory, loadWorkspacesAndThreads, renderThreadItem, syncAgentState, renderWorkspacesDrawer, loadCloudFiles, refreshVisibleThread, scheduleHistoryRefresh, openDirectoryBrowser, renderDeviceApps, selectDeviceApp, handleAgentsList, document };', context);
   const app = context.app;
   app.state.selectedAgentId = 'agent';
+  app.state.selectedApp = 'codex';
+  app.state.runtimeDeviceId = 'agent';
   app.state.agents = [{ agentId: 'agent', online: true, trusted: true }];
   app.state.ws = { readyState: 1, send: (data) => sent.push(JSON.parse(data)) };
   app.activateThreadView(app.getThreadView('A'));
@@ -111,6 +113,42 @@ function setup(options = {}) {
   const notify = (method, params) => app.handleIncomingCodexPayload({ method, params }, 'agent');
   return { ...app, sent, respond, notify, timers, storage };
 }
+
+test('device launcher lists only enabled applications and links each native UI to its device', async () => {
+  const app = setup();
+  app.state.agents = [
+    { agentId: 'agent', name: '本地电脑', online: true, trusted: true, dshWeb: { enabled: true, status: 'ready' }, opencodeWeb: { enabled: true, status: 'ready' } },
+    { agentId: 'server', name: '测试服务器', online: true, trusted: true, codexEnabled: false, opencodeWeb: { enabled: true, status: 'ready' } },
+  ];
+  app.selectDeviceApp(null);
+  assert.equal(app.el.appCards.children.length, 3);
+  assert.equal(app.el.appCards.children[1].href, '/dsh/agent/');
+  assert.equal(app.el.appCards.children[2].href, '/opencode/agent/');
+  assert.equal(app.el.appCards.children[2].target, '_blank');
+  assert.ok(app.el.chatContainer.classList.contains('hidden'));
+  app.el.agentSelect.value = 'server'; app.el.agentSelect.onchange();
+  assert.equal(app.state.selectedApp, null);
+  assert.equal(app.el.appCards.children.length, 1);
+  assert.equal(app.el.appCards.children[0].href, '/opencode/server/');
+  await app.loadWorkspacesAndThreads(); await app.syncAgentState();
+  assert.equal(app.sent.length, 0, 'OpenCode-only devices must not receive Codex RPCs');
+});
+
+test('offline or untrusted devices stay selected with disabled applications', () => {
+  const app = setup();
+  app.state.selectedApp = null;
+  app.handleAgentsList([
+    { agentId: 'agent', name: '离线电脑', online: false, trusted: true, opencodeWeb: { enabled: true, status: 'offline' } },
+    { agentId: 'server', name: '服务器', online: true, trusted: true, codexEnabled: false },
+  ]);
+  assert.equal(app.state.selectedAgentId, 'agent');
+  assert.ok(app.el.appCards.children.every((card) => card.disabled && !card.href));
+  app.selectDeviceApp('codex');
+  assert.equal(app.state.selectedApp, null);
+  app.state.agents[0].online = true; app.state.agents[0].trusted = false;
+  app.renderDeviceApps();
+  assert.ok(app.el.appCards.children.every((card) => card.disabled));
+});
 
 const user = (id, text) => ({ id, type: 'userMessage', content: [{ type: 'text', text }] });
 const agent = (id, text) => ({ id, type: 'agentMessage', text });

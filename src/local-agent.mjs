@@ -10,6 +10,7 @@ import { connectWebSocketClient } from './ws-minimal.mjs';
 import { startManagedDsh, createDshAgentBridge } from './dsh-web.mjs';
 import { clearUploadCredentials, registrationUploadToken, saveUploadCredentials, uploadAgentFile } from './file-upload.mjs';
 import { waitForPreviousAgent } from './agent-process.mjs';
+import { startManagedOpenCode, openCodeRewriter } from './opencode-web.mjs';
 
 const READ_ONLY_METHODS = new Set([
   'remote/getWorkspacesAndThreads',
@@ -125,6 +126,11 @@ export function readDesktopGlobalWorkspaces(codexHome = path.join(os.homedir(), 
  *   dshBin?: string,
  *   dshPort?: number,
  *   dshCwd?: string,
+ *   codexEnabled?: boolean,
+ *   opencodeEnabled?: boolean,
+ *   opencodeBin?: string,
+ *   opencodePort?: number,
+ *   opencodeCwd?: string,
  *   codexBin?: string,
  *   codexHome?: string,
  *   profile?: string | null,
@@ -137,6 +143,8 @@ export function readDesktopGlobalWorkspaces(codexHome = path.join(os.homedir(), 
  * }} [options]
  */
 export function startLocalAgent(options = {}) {
+  const codexEnabled = options.codexEnabled ?? (process.env.CODEX_CODEX_ENABLED !== '0');
+  const opencodeEnabled = options.opencodeEnabled ?? (process.env.CODEX_OPENCODE_ENABLED === '1');
   const codexHome = options.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
   const relayUrl =
     options.relayUrl || process.env.CODEX_RELAY_URL || 'ws://127.0.0.1:3280/ws/agent';
@@ -171,7 +179,7 @@ export function startLocalAgent(options = {}) {
   const requestTimeoutMs = options.requestTimeoutMs ?? 30000;
   let processEpoch = null;
   let stateRevision = 0;
-  let serverStatus = 'starting';
+  let serverStatus = codexEnabled ? 'starting' : 'disabled';
   let serverError = null;
   let processRestartTimer = null;
   let resettingProcess = false;
@@ -191,6 +199,7 @@ export function startLocalAgent(options = {}) {
 
   function publishAgentState() {
     stateRevision++;
+    activeWs?.send({ type: 'agent/codex_status', status: serverStatus });
     activeWs?.send({ type: 'agent/rpc', clientId: null,
       payload: { method: 'remote/agentState', params: agentSnapshot() } });
   }
@@ -245,6 +254,23 @@ export function startLocalAgent(options = {}) {
   let stopped = false;
   let reconnectTimer = null;
   let dshManager = null;
+  let opencodeManager = null;
+  const opencodeBridge = createDshAgentBridge({ service: 'opencode', rewriteResponse: openCodeRewriter(identity.agentId),
+    getTarget: async () => {
+      if (!opencodeManager) throw new Error('OpenCode is disabled');
+      return opencodeManager.target();
+    },
+  });
+  if (opencodeEnabled) {
+    opencodeManager = startManagedOpenCode({
+      bin: options.opencodeBin || process.env.CODEX_OPENCODE_BIN || 'opencode',
+      port: Number(options.opencodePort ?? process.env.CODEX_OPENCODE_PORT ?? 3082),
+      cwd: options.opencodeCwd || process.env.CODEX_OPENCODE_CWD || defaultCwd,
+      quiet: options.quiet,
+      onStatus: (opencodeWeb) => activeWs?.send({ type: 'agent/opencode_status', opencodeWeb }),
+      onRestart: () => opencodeBridge.disconnect(true),
+    });
+  }
   const dshEnabled = options.dshEnabled ?? process.env.CODEX_DSH_ENABLED === '1';
   const dshBridge = createDshAgentBridge({ getTarget: async () => {
     if (!dshManager) throw new Error('DSH Web is disabled');
@@ -293,6 +319,7 @@ export function startLocalAgent(options = {}) {
   }
 
   function spawnCodexAppServer() {
+    if (!codexEnabled) return;
     if (processRestartTimer) { clearTimeout(processRestartTimer); processRestartTimer = null; }
     clearProcessRequests('本机 Codex 已重启，未完成的操作已中断，请刷新会话');
     processEpoch = crypto.randomUUID();
@@ -542,6 +569,10 @@ export function startLocalAgent(options = {}) {
 
     if (payload.method === 'remote/getAgentState') {
       replyToClient(clientId, payload.id, agentSnapshot());
+      return;
+    }
+    if (!codexEnabled) {
+      replyToClient(clientId, payload.id, null, new Error('该设备未启用 Codex，请选择 DSH 或 OpenCode 入口'));
       return;
     }
     if (payload.method === 'remote/respondToRequest') {
@@ -799,10 +830,14 @@ export function startLocalAgent(options = {}) {
       if (stopped) { ws.close(); return; }
       activeWs = ws;
       dshBridge.attach((message) => ws.send(message));
+      opencodeBridge.attach((message) => ws.send(message));
 
       ws.send({
         type: 'agent/register',
         dshWeb: dshManager?.status || { enabled: false, status: 'disabled' },
+        opencodeWeb: opencodeManager?.status || { enabled: false, status: 'disabled' },
+        codexEnabled,
+        codexStatus: serverStatus,
         agentId: identity.agentId,
         name: agentName,
         hostname: os.hostname(),
@@ -825,6 +860,7 @@ export function startLocalAgent(options = {}) {
         }
 
         if (dshBridge.handle(msg)) return;
+        if (opencodeBridge.handle(msg)) return;
 
         if (msg.type === 'relay/registered') {
           if (!msg.trusted) clearUploadCredentials(codexHome, relayUrl);
@@ -859,7 +895,7 @@ export function startLocalAgent(options = {}) {
       });
 
       ws.on('close', () => {
-        if (activeWs === ws) { activeWs = null; dshBridge.disconnect(); }
+        if (activeWs === ws) { activeWs = null; dshBridge.disconnect(); opencodeBridge.disconnect(); }
         if (!stopped) {
           reconnectTimer = setTimeout(connectLoop, 2500);
           reconnectTimer.unref();
@@ -890,8 +926,8 @@ export function startLocalAgent(options = {}) {
     console.log(`🆔 Agent ID          : ${identity.agentId} (${agentName})`);
     console.log(`☁️  Cloud Relay URL   : ${relayUrl}`);
     console.log(`📂 Default Workspace : ${defaultCwd}`);
-    console.log(`⚙️  Codex Profile     : ${currentProfile || '(default)'}`);
-    if (requiresE2E) {
+    if (codexEnabled) console.log(`⚙️  Codex Profile     : ${currentProfile || '(default)'}`);
+    if (codexEnabled && requiresE2E) {
       console.log('🔐 配对密钥已保存；在本机运行 codex-up --show-pairing-key 查看');
     }
     console.log('==========================================================');
@@ -900,10 +936,13 @@ export function startLocalAgent(options = {}) {
   return {
     identity,
     get dshStatus() { return dshManager?.status || { enabled: false, status: 'disabled' }; },
+    get opencodeStatus() { return opencodeManager?.status || { enabled: false, status: 'disabled' }; },
     stop() {
       stopped = true;
       dshBridge.disconnect();
       dshManager?.stop();
+      opencodeBridge.disconnect();
+      opencodeManager?.stop();
       if (recycleTimer) clearTimeout(recycleTimer);
       if (processRestartTimer) clearTimeout(processRestartTimer);
       clearProcessRequests('本机 Agent 已停止');
@@ -922,7 +961,7 @@ export function startLocalAgent(options = {}) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('用法：codex-up [--profile 名称] [--name 设备名] [--no-dsh]\n' +
+    console.log('用法：codex-up [--profile 名称] [--name 设备名] [--no-dsh] [--opencode] [--no-codex]\n' +
       '      codex-up --upload 文件路径 [--name 下载名称]\n' +
       '      codex-up --show-pairing-key\n' +
       '      codex-up service install|start|stop|restart|status|logs|uninstall');
@@ -933,6 +972,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   let agentName = process.env.CODEX_AGENT_NAME;
   let requiresE2E = process.env.CODEX_DISABLE_E2E !== '1';
   let dshEnabled = process.env.CODEX_DSH_ENABLED !== '0';
+  let codexEnabled = process.env.CODEX_CODEX_ENABLED !== '0';
+  let opencodeEnabled = process.env.CODEX_OPENCODE_ENABLED === '1';
   let threadId;
   let uploadName;
 
@@ -943,6 +984,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     else if (args[i] === '--no-e2e') requiresE2E = false;
     else if (args[i] === '--no-dsh') dshEnabled = false;
     else if (args[i] === '--dsh') dshEnabled = true;
+    else if (args[i] === '--no-codex') codexEnabled = false;
+    else if (args[i] === '--opencode') opencodeEnabled = true;
+    else if (args[i] === '--no-opencode') opencodeEnabled = false;
     else if (args[i] === '--thread-id' && args[i + 1]) threadId = args[++i];
   }
 
@@ -963,7 +1007,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   } else {
     try { await waitForPreviousAgent({ wait: args.includes('--service-run') }); }
     catch (error) { console.error(error.message); process.exit(75); }
-    const agent = startLocalAgent({ relayUrl, profile, agentName, requiresE2E, dshEnabled });
+    const agent = startLocalAgent({ relayUrl, profile, agentName, requiresE2E, dshEnabled, codexEnabled, opencodeEnabled });
     process.on('SIGINT', () => { agent.stop(); process.exit(0); });
     process.on('SIGTERM', () => { agent.stop(); process.exit(0); });
   }

@@ -22,7 +22,7 @@
           </svg>
         </div>
         <h1>Codex Remote</h1>
-        <p class="subtitle">连接本机工作区与会话</p>
+        <p class="subtitle">连接设备上的 Codex、DSH 与 OpenCode</p>
       </div>
       <form id="login-form" autocomplete="on">
         <div class="field">
@@ -51,14 +51,14 @@
           <label for="agent-select">设备</label>
           <select id="agent-select" class="select-input"></select>
         </div>
-        <div class="drawer-sub-actions">
+        <div id="codex-actions" class="drawer-sub-actions">
           <button id="btn-refresh-threads" class="btn-ghost">刷新</button>
           <button id="btn-browse-dir" class="btn-ghost">目录</button>
           <button id="btn-switch-profile" class="btn-ghost">Profile</button>
         </div>
       </div>
 
-      <div class="drawer-search">
+      <div id="codex-search" class="drawer-search">
         <input id="thread-search-input" type="search" placeholder="搜索会话..." />
       </div>
 
@@ -94,7 +94,7 @@
         </div>
         <div class="topbar-actions">
           <button id="btn-files" class="btn-small" title="云端文件">文件</button>
-          <a id="btn-dsh-web" class="dsh-link hidden" target="_blank" rel="noopener noreferrer">DSH</a>
+          <button id="btn-device-apps" class="btn-small hidden">应用</button>
           <button id="btn-e2e-key" class="icon-btn" title="配对密钥" aria-label="配对密钥">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
               <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
@@ -120,6 +120,11 @@
       </div>
 
       <!-- 对话消息流主区域 -->
+      <section id="device-apps" class="device-apps" aria-labelledby="device-apps-title">
+        <h1 id="device-apps-title">设备应用</h1>
+        <p id="device-apps-status" role="status"></p>
+        <div id="app-cards" class="app-cards"></div>
+      </section>
       <main id="chat-container" class="chat-container">
         <div id="chat-empty" class="chat-empty">
           <div class="empty-icon" aria-hidden="true">
@@ -137,13 +142,13 @@
         <div id="thread-status" class="thread-status hidden" role="status" aria-live="polite"></div>
       </main>
 
-      <div class="chat-quick-actions">
+      <div id="codex-quick-actions" class="chat-quick-actions">
         <button id="btn-pending-requests" class="btn-small hidden">待处理请求</button>
         <button id="btn-jump-latest" class="btn-small hidden">回到最新消息 ↓</button>
       </div>
 
       <!-- 底部消息输入栏 + 模型/推理强度控制栏 -->
-      <footer class="composer">
+      <footer id="codex-composer" class="composer">
         <div class="composer-toolbar">
           <div class="model-pill" title="选择模型">
             <span class="pill-label">模型</span>

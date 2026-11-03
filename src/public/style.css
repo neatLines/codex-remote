@@ -1193,3 +1193,13 @@ html, body {
 #btn-more-threads { flex: 0 0 auto; margin: 6px 12px; }
 .history-more { flex: 0 0 auto; }
 .chat-quick-actions:has(> .hidden:first-child):has(> .hidden:last-child) { display: none; }
+.device-apps { flex: 1; overflow: auto; padding: clamp(24px, 5vw, 64px); }
+.device-apps h1 { margin: 0 0 8px; font-size: 26px; overflow-wrap: anywhere; }
+.device-apps > p { margin: 0 0 28px; color: var(--text-secondary); }
+.app-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 16px; max-width: 900px; }
+.app-card { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; padding: 24px; min-height: 180px; border: 1px solid var(--border-color); border-radius: 16px; background: var(--bg-card); color: var(--text-primary); font: inherit; text-align: left; text-decoration: none; cursor: pointer; }
+.app-card:hover:not(:disabled), .app-card:focus-visible { border-color: var(--accent); background: var(--accent-soft); }
+.app-card strong { font-size: 20px; }
+.app-card:disabled { opacity: .65; cursor: default; }
+.app-status { font-size: 13px; color: var(--text-secondary); }
+.app-action { margin-top: auto; font-size: 13px; color: var(--accent); }

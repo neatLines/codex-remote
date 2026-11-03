@@ -20,7 +20,7 @@
    - 历史消息和流式回复支持标题、列表、代码块、表格等 Markdown 格式，使用随项目提供的 Marked 与 DOMPurify 渲染和过滤，无需访问 CDN。
    - 切换会话时保留各会话的消息、执行和审批状态；发送目标在提交时固定，加载历史不会覆盖更新的实时消息。
 6. **DSH Web 转发与统一登录**：
-   - `codex-up` 自动管理本机 DSH Web，默认监听 `127.0.0.1:3081`。登录 Remote 并信任设备后，点击顶部 **DSH** 打开原生页面，复用访问口令与 TOTP 会话。
+   - `codex-up` 自动管理本机 DSH Web，默认监听 `127.0.0.1:3081`。登录 Remote 并信任设备后，选择设备，再点击 **DSH** 应用卡片打开原生页面，复用访问口令与 TOTP 会话。
    - 页面、API、上传下载、SSE 和 WebSocket 通过既有 Agent 连接流式转发；DSH 启动令牌与会话 Cookie 仅保存在本机 Agent 中。
 7. **完整交互与执行恢复**：
    - 问答支持选择、自定义回答、多题与私密输入；命令、文件和权限审批显示请求范围，插件支持结构化表单与验证链接。未知交互会显示明确提示和拒绝入口。
@@ -39,7 +39,7 @@
 
 ## 快速使用
 
-需要 Node.js 20+、本机已安装并登录的 Codex CLI。DSH 功能可选，启用时还需安装 `dsh`；运行 TLS 测试需要 `openssl`。
+需要 Node.js 20+。启用 Codex 时需安装并登录 Codex CLI；DSH 功能需安装 `dsh`；OpenCode 功能需安装 OpenCode 2.0.32。运行 TLS 测试需要 `openssl`。
 
 在项目目录准备本地配置：
 
@@ -127,7 +127,25 @@ CODEX_RELAY_CA_FILE=/absolute/path/to/your-ca.crt
 
 该 CA 只用于 Agent 的中继连接，证书链和服务器 IP 校验仍保持启用。浏览器或手机需要导入并信任同一 CA；HTTP 与 HTTPS 的浏览器本地存储独立，切换后需要在 HTTPS 页面重新登录、填写本机配对密钥。证书私钥保存在服务器 `/etc/ssl/codex-remote/`，不放入网页目录。更新 `.env` 后重启 `codex-up`。
 
-### 4. 托管 DSH Web
+### 4. 设备与原生应用
+
+服务器和本地电脑都注册为设备。登录后先选设备，页面展示该设备启用的应用及运行状态：Codex 进入 Remote 会话界面，DSH 和 OpenCode 在新标签页打开原生界面。设备离线时保留入口但禁止打开；切换设备回到应用列表。每个原生页面的 URL 固定包含设备 ID，可同时打开不同设备的会话。
+
+OpenCode：先在设备上配置并验证 OpenCode 2.0.32 的模型供应商，然后运行：
+
+```bash
+codex-up --opencode                       # 本地电脑：Codex + DSH + OpenCode
+codex-up --opencode --no-codex --no-dsh   # 服务器：只运行 OpenCode
+codex-up service install --opencode --no-codex --no-dsh  # Linux 常驻
+```
+
+OpenCode 仅监听 `127.0.0.1:3082`，使用每次启动随机生成的服务口令，网页通过 `/opencode/<agentId>/` 访问。无需开放额外公网端口。可通过 `CODEX_OPENCODE_BIN`、`CODEX_OPENCODE_PORT`、`CODEX_OPENCODE_CWD` 指定程序、端口与默认目录；`--no-opencode` 或 `CODEX_OPENCODE_ENABLED=0` 关闭。配置中的凭据由 OpenCode 自己保存，Remote 不把供应商密钥写入前端配置。
+
+适配器保留 OpenCode 原生界面，只调整设备 URL 前缀、资源路径和路由，关闭其 Service Worker，并压缩文本资源以降低带宽消耗。当前固定支持 **2.0.32**，升级前需验证原生前端适配；建议设置 OpenCode 的 `"update": "disable"`。两台设备各自保存项目和会话，切换设备不会迁移工作目录或执行任务。
+
+与 DSH 相同，OpenCode 原生 API 使用 Remote 登录与设备信任鉴权，不使用 Codex RPC 的 HMAC 签名；退出登录或撤销信任会关闭代理连接。OpenCode 以启动它的系统用户权限执行，服务器建议使用专用普通用户。
+
+#### DSH Web
 
 本机安装 `dsh` 后直接运行 `codex-up`。它会从用户主目录启动 `dsh web --no-open --host 127.0.0.1 --port 3081`，自动换取 DSH 会话，进程退出后重试，停止 `codex-up` 时一并停止托管进程。工作目录、可执行文件和端口可通过 `.env` 中的 `CODEX_DSH_CWD`、`CODEX_DSH_BIN`、`CODEX_DSH_PORT` 设置；使用 `codex-up --no-dsh` 或 `CODEX_DSH_ENABLED=0` 可关闭。
 

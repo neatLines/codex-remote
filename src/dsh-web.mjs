@@ -1,8 +1,12 @@
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import os from 'node:os';
+import { Readable } from 'node:stream';
+import { gzip } from 'node:zlib';
+import { promisify } from 'node:util';
 import { cleanHeaders, decodeChunk, queueChunk, acknowledge, endStream } from './dsh-tunnel.mjs';
 
+const compressWebAsset = promisify(gzip);
 const redact = (text) => String(text).replace(/([?&]token=)[^\s&]+/g, '$1[redacted]');
 
 function exchangeCookie(base, token) {
@@ -105,12 +109,14 @@ export function startManagedDsh({ bin = 'dsh', port = 3081, cwd = os.homedir(), 
   };
 }
 
-export function createDshAgentBridge({ getTarget }) {
+export function createDshAgentBridge({ getTarget, service = 'dsh', rewriteResponse }) {
+  if (!['dsh', 'opencode'].includes(service)) throw new Error('Unknown web service');
   const tunnels = new Map();
   let send = () => false;
   function dispose(entry, notify = false) {
     if (!tunnels.delete(entry.id)) return;
     entry.request?.destroy(); entry.socket?.destroy();
+    entry.source?.destroy();
     if (notify) entry.send({ type: 'dsh/close', id: entry.id });
   }
   function fail(entry) {
@@ -137,19 +143,45 @@ export function createDshAgentBridge({ getTarget }) {
       const headers = cleanHeaders(message.headers, entry.websocket);
       headers.host = base.host;
       headers.origin = base.origin;
-      headers.cookie = target.cookie;
+      if (target.cookie) headers.cookie = target.cookie;
+      if (target.authorization) headers.authorization = target.authorization;
+      if (rewriteResponse) headers['accept-encoding'] = 'identity';
       if (entry.websocket) { headers.connection = 'Upgrade'; headers.upgrade = 'websocket'; }
       const request = http.request({ hostname: base.hostname, port: base.port, method: message.method,
-        path: message.path, headers, agent: false }, (response) => {
+        path: message.path, headers, agent: false }, async (response) => {
         if (entry.websocket) { response.resume(); fail(entry); return; }
         if (!tunnels.has(entry.id)) { response.destroy(); return; }
-        entry.source = response;
+        let source = response;
+        const responseHeaders = cleanHeaders(response.headers);
+        if (rewriteResponse?.matches(message.path, responseHeaders)) {
+          try {
+            const chunks = []; let length = 0;
+            for await (const chunk of response) {
+              length += chunk.length;
+              if (length > 16 * 1024 * 1024) throw new Error('Web asset too large');
+              chunks.push(chunk);
+            }
+            if (!tunnels.has(entry.id)) return;
+            let body = await rewriteResponse.transform(message.path, Buffer.concat(chunks), responseHeaders);
+            delete responseHeaders['content-encoding']; delete responseHeaders.etag;
+            if (/\bgzip\b(?!\s*;\s*q=0(?:\D|$))/i.test(message.headers?.['accept-encoding'] || '') && body.length > 1024) {
+              body = await compressWebAsset(body);
+              responseHeaders['content-encoding'] = 'gzip';
+              responseHeaders.vary = 'Accept-Encoding';
+            }
+            if (!tunnels.has(entry.id)) return;
+            responseHeaders['content-length'] = String(body.length);
+            responseHeaders['cache-control'] = 'no-store';
+            source = Readable.from([body]);
+          } catch { fail(entry); return; }
+        }
+        entry.source = source;
         entry.onEndSent = () => dispose(entry);
-        entry.send({ type: 'dsh/headers', id: entry.id, status: response.statusCode, headers: cleanHeaders(response.headers) });
-        response.on('data', (chunk) => { try { queueChunk(entry, chunk); } catch { fail(entry); } });
-        response.on('end', () => endStream(entry));
-        response.on('error', () => fail(entry));
-        response.on('aborted', () => fail(entry));
+        entry.send({ type: 'dsh/headers', id: entry.id, status: response.statusCode, headers: responseHeaders });
+        source.on('data', (chunk) => { try { queueChunk(entry, chunk); } catch { fail(entry); } });
+        source.on('end', () => endStream(entry));
+        source.on('error', () => fail(entry));
+        source.on('aborted', () => fail(entry));
       });
       entry.request = request;
       entry.destination = request;
@@ -171,9 +203,10 @@ export function createDshAgentBridge({ getTarget }) {
     } catch { fail(entry); }
   }
   return {
-    attach(sender) { this.disconnect(); send = sender; },
+    attach(sender) { this.disconnect(); send = (message) => sender({ ...message, type: message.type.replace(/^dsh\//, `${service}/`) }); },
     handle(message) {
-      if (!message.type?.startsWith('dsh/')) return false;
+      if (!message.type?.startsWith(`${service}/`)) return false;
+      message = { ...message, type: message.type.replace(`${service}/`, 'dsh/') };
       if (message.type === 'dsh/open') {
         if (typeof message.id !== 'string' || tunnels.has(message.id) || tunnels.size >= 128) return true;
         open(message); return true;

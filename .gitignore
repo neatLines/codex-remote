@@ -2,6 +2,12 @@
 .env
 .env.*
 !.env.example
+.apikey
+.apikey.*
+opencode.json
+opencode.jsonc
+opencode.*backup*.json
+opencode.*backup*.jsonc
 *.pem
 *.key
 *.crt

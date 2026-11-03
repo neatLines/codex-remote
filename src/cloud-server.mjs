@@ -207,6 +207,9 @@ export function createCloudServer(options = {}) {
         defaultCwd: info.defaultCwd,
         profile: info.profile || null,
         dshWeb: info.dshWeb || { enabled: false, status: 'disabled' },
+        opencodeWeb: info.opencodeWeb || { enabled: false, status: 'disabled' },
+        codexEnabled: info.codexEnabled !== false,
+        codexStatus: info.codexStatus || 'ready',
         requiresE2E: Boolean(info.requiresE2E),
         e2eKeyFingerprint: info.e2eKeyFingerprint || null,
         trusted: Boolean(authStore.state.trustedAgents[agentId]),
@@ -224,6 +227,10 @@ export function createCloudServer(options = {}) {
           platform: saved.platform || '',
           defaultCwd: saved.defaultCwd || '',
           profile: saved.profile || null,
+          codexEnabled: saved.codexEnabled !== false,
+          codexStatus: 'offline',
+          dshWeb: { enabled: saved.dshWeb?.enabled === true, status: 'offline' },
+          opencodeWeb: { enabled: saved.opencodeWeb?.enabled === true, status: 'offline' },
           requiresE2E: Boolean(saved.requiresE2E),
           e2eKeyFingerprint: saved.e2eKeyFingerprint || null,
           trusted: true,
@@ -253,6 +260,11 @@ export function createCloudServer(options = {}) {
     agents, isAuthenticated: isRequestAuthenticated,
     isTrusted: (agentId) => Boolean(authStore.state.trustedAgents[agentId]),
     publicOrigin: env.CODEX_PUBLIC_ORIGIN,
+  });
+  const opencodeProxy = createDshProxy({
+    agents, isAuthenticated: isRequestAuthenticated,
+    isTrusted: (agentId) => Boolean(authStore.state.trustedAgents[agentId]),
+    publicOrigin: env.CODEX_PUBLIC_ORIGIN, service: 'opencode',
   });
   const fileStore = createFileStore({ dataDir, env, authStore, isAuthenticated: isRequestAuthenticated,
     onChange: (file) => broadcastToClients({ type: 'relay/filesChanged', file }),
@@ -353,6 +365,7 @@ export function createCloudServer(options = {}) {
     // 3. Logout
     if (req.method === 'POST' && pathname === '/api/auth/logout') {
       dshProxy.closeSession(req.headers.cookie);
+      opencodeProxy.closeSession(req.headers.cookie);
       sendJson(
         res,
         200,
@@ -406,6 +419,9 @@ export function createCloudServer(options = {}) {
           platform: live?.platform || '',
           defaultCwd: live?.defaultCwd || '',
           profile: live?.profile || null,
+          codexEnabled: live?.codexEnabled !== false,
+          dshWeb: live?.dshWeb,
+          opencodeWeb: live?.opencodeWeb,
           requiresE2E: Boolean(live?.requiresE2E),
           e2eKeyFingerprint: live?.e2eKeyFingerprint || null,
           trustedAt: Date.now(),
@@ -419,6 +435,7 @@ export function createCloudServer(options = {}) {
         delete authStore.state.trustedAgents[agentId];
         fileStore.revoke(agentId);
         dshProxy.revoke(agentId);
+        opencodeProxy.revoke(agentId);
         if (live) {
           live.ws.send({ type: 'relay/trusted', trusted: false });
         }
@@ -435,6 +452,7 @@ export function createCloudServer(options = {}) {
 
     if (await fileStore.handleHttp(req, res)) return;
     if (dshProxy.handleHttp(req, res)) return;
+    if (opencodeProxy.handleHttp(req, res)) return;
 
     // 6. Serve Static Assets
     let relPath = pathname === '/' ? '/index.html' : pathname;
@@ -463,6 +481,7 @@ export function createCloudServer(options = {}) {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
     if (dshProxy.handleUpgrade(req, socket, head)) return;
+    if (opencodeProxy.handleUpgrade(req, socket, head)) return;
 
     if (url.pathname === '/ws/client') {
       if (!isRequestAuthenticated(req)) {
@@ -594,10 +613,14 @@ export function createCloudServer(options = {}) {
             profile: msg.profile ? String(msg.profile) : null,
             requiresE2E: Boolean(msg.requiresE2E),
             fileUploads: msg.fileUploads === true,
+            codexEnabled: msg.codexEnabled !== false,
+            codexStatus: ['starting', 'ready', 'error', 'disabled'].includes(msg.codexStatus) ? msg.codexStatus : 'ready',
             e2eKeyFingerprint: msg.e2eKeyFingerprint ? String(msg.e2eKeyFingerprint) : null,
             connectedAt: Date.now(),
             dshWeb: { enabled: msg.dshWeb?.enabled === true,
               status: ['starting', 'ready', 'error'].includes(msg.dshWeb?.status) ? msg.dshWeb.status : 'disabled' },
+            opencodeWeb: { enabled: msg.opencodeWeb?.enabled === true,
+              status: ['starting', 'ready', 'error'].includes(msg.opencodeWeb?.status) ? msg.opencodeWeb.status : 'disabled' },
           };
           agents.set(agentId, agentInfo);
 
@@ -610,6 +633,9 @@ export function createCloudServer(options = {}) {
               platform: agentInfo.platform,
               defaultCwd: agentInfo.defaultCwd,
               profile: agentInfo.profile,
+              codexEnabled: agentInfo.codexEnabled,
+              dshWeb: agentInfo.dshWeb,
+              opencodeWeb: agentInfo.opencodeWeb,
               requiresE2E: agentInfo.requiresE2E,
               e2eKeyFingerprint: agentInfo.e2eKeyFingerprint,
               lastSeenAt: Date.now(),
@@ -632,6 +658,24 @@ export function createCloudServer(options = {}) {
 
         if (!registeredAgentId) return;
         if (dshProxy.handleMessage(registeredAgentId, ws, msg)) return;
+        if (opencodeProxy.handleMessage(registeredAgentId, ws, msg)) return;
+        if (msg.type === 'agent/codex_status') {
+          const agent = agents.get(registeredAgentId);
+          if (agent?.ws === ws && agent.codexStatus !== msg.status && ['starting', 'ready', 'error', 'disabled'].includes(msg.status)) {
+            agent.codexStatus = msg.status;
+            broadcastAgentsUpdate();
+          }
+          return;
+        }
+        if (msg.type === 'agent/opencode_status') {
+          const agent = agents.get(registeredAgentId);
+          if (agent?.ws === ws) {
+            agent.opencodeWeb = { enabled: msg.opencodeWeb?.enabled === true,
+              status: ['starting', 'ready', 'error'].includes(msg.opencodeWeb?.status) ? msg.opencodeWeb.status : 'disabled' };
+            broadcastAgentsUpdate();
+          }
+          return;
+        }
         if (msg.type === 'agent/dsh_status') {
           const agent = agents.get(registeredAgentId);
           if (agent?.ws === ws) {
@@ -666,6 +710,7 @@ export function createCloudServer(options = {}) {
 
       ws.on('close', () => {
         dshProxy.disconnect(ws);
+        opencodeProxy.disconnect(ws);
         if (registeredAgentId && agents.get(registeredAgentId)?.ws === ws) {
           agents.delete(registeredAgentId);
           if (authStore.state.trustedAgents[registeredAgentId]) {
@@ -733,6 +778,7 @@ export function createCloudServer(options = {}) {
       clearInterval(pingTimer);
       fileStore.close();
       dshProxy.close();
+      opencodeProxy.close();
       for (const c of clients) c.ws.close();
       for (const a of agents.values()) a.ws.close();
       await Promise.all([server, redirectServer].filter(Boolean).map((target) =>
