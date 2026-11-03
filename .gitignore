@@ -11,6 +11,8 @@
 auth.json
 remote-agent-identity.json
 remote-agent-upload.json
+remote-agent.lock
+service.env
 
 # Local runtime state and agent tooling
 /data/

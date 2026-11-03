@@ -66,6 +66,31 @@ cp .env.example .env
 ./bin/codex-up --show-pairing-key
 ```
 
+Linux 上可安装为当前用户的 systemd 后台服务：
+
+```bash
+# 需要代理时先 proxyon，安装会保存当前代理和 PATH；服务仍会加载项目 .env
+codex-up service install
+
+systemctl --user status codex-up
+systemctl --user restart codex-up
+systemctl --user stop codex-up
+journalctl --user -u codex-up -f
+
+# 可选：指定启动参数或仅安装、不立即启动
+codex-up service install --profile deepseek --cwd /path/to/workspace
+codex-up service install --no-start
+
+# 卸载服务
+codex-up service uninstall
+```
+
+安装默认启用开机自启动和用户驻留（linger），退出终端、退出登录后继续运行，进程退出后自动重启。若系统要求管理员权限，安装命令会提示执行 `sudo loginctl enable-linger 用户名`；完成此步骤才会在用户尚未登录时启动。服务以当前用户身份运行，沿用本机 Codex 登录、设备身份及配对密钥。
+
+服务配置位于 `~/.config/systemd/user/codex-up.service`，代理、PATH 和启动环境保存于 `~/.config/codex-remote/service.env`（权限 600；遵循 `XDG_CONFIG_HOME`）。修改项目 `.env` 后重启服务即可；重新安装会更新保存的代理与命令路径，切换 Node/NVM 版本后也应重新安装。现有服务的启动参数更新后，执行一次 `codex-up service restart` 生效。
+
+安装时若已有前台 Agent，服务会等待它退出后接管，避免重复连接；当前任务结束后在原终端按 Ctrl+C 即可。服务运行期间仍可执行 `codex-up --upload ...` 或 `--show-pairing-key`。也可用 `codex-up service start|stop|restart|status|logs` 管理。
+
 ### 2. 启动云端服务
 
 在服务器的项目目录中加载自己的配置并启动网关：

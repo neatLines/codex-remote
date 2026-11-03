@@ -20,4 +20,35 @@ if [ -f "${PROJECT_DIR}/.env" ]; then
   set +a
 fi
 
-exec node "${PROJECT_DIR}/src/local-agent.mjs" "$@"
+CODEX_UP_NODE_BIN="${CODEX_SERVICE_NODE:-node}"
+if [ "${1:-}" = "service" ]; then
+  shift
+  exec "${CODEX_UP_NODE_BIN}" "${PROJECT_DIR}/src/systemd-service.mjs" "$@"
+fi
+
+# One-off upload/key commands can run while the background Agent owns the lock.
+CODEX_UP_IS_AGENT=1
+CODEX_UP_IS_SERVICE=0
+for CODEX_UP_ARG in "$@"; do
+  case "${CODEX_UP_ARG}" in
+    --upload|--show-pairing-key|--help|-h) CODEX_UP_IS_AGENT=0 ;;
+    --service-run) CODEX_UP_IS_SERVICE=1 ;;
+  esac
+done
+if [ "${CODEX_UP_IS_AGENT}" = 1 ] && [ "$(uname -s)" = Linux ] && command -v flock >/dev/null 2>&1; then
+  CODEX_UP_AGENT_DIR="${CODEX_HOME:-${HOME}/.codex}"
+  mkdir -p "${CODEX_UP_AGENT_DIR}"
+  umask 077
+  exec 9>"${CODEX_UP_AGENT_DIR}/remote-agent.lock"
+  if ! flock -n 9; then
+    if [ "${CODEX_UP_IS_SERVICE}" = 1 ]; then
+      printf '%s\n' '服务等待现有 Agent 退出后接管…'
+      flock 9
+    else
+      printf '%s\n' '已有 codex-up Agent 正在运行，请使用 systemctl --user 管理服务。' >&2
+      exit 75
+    fi
+  fi
+fi
+
+exec "${CODEX_UP_NODE_BIN}" "${PROJECT_DIR}/src/local-agent.mjs" "$@"

@@ -9,6 +9,7 @@ import { AgentInteractions } from './agent-interactions.mjs';
 import { connectWebSocketClient } from './ws-minimal.mjs';
 import { startManagedDsh, createDshAgentBridge } from './dsh-web.mjs';
 import { clearUploadCredentials, registrationUploadToken, saveUploadCredentials, uploadAgentFile } from './file-upload.mjs';
+import { waitForPreviousAgent } from './agent-process.mjs';
 
 const READ_ONLY_METHODS = new Set([
   'remote/getWorkspacesAndThreads',
@@ -917,6 +918,13 @@ export function startLocalAgent(options = {}) {
 // Run directly if invoked as main script
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log('用法：codex-up [--profile 名称] [--name 设备名] [--no-dsh]\n' +
+      '      codex-up --upload 文件路径 [--name 下载名称]\n' +
+      '      codex-up --show-pairing-key\n' +
+      '      codex-up service install|start|stop|restart|status|logs|uninstall');
+    process.exit(0);
+  }
   let relayUrl = process.env.CODEX_RELAY_URL;
   let profile = process.env.CODEX_PROFILE || null;
   let agentName = process.env.CODEX_AGENT_NAME;
@@ -950,6 +958,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       console.error(error.message); process.exitCode = 1;
     }
   } else {
+    try { await waitForPreviousAgent({ wait: args.includes('--service-run') }); }
+    catch (error) { console.error(error.message); process.exit(75); }
     const agent = startLocalAgent({ relayUrl, profile, agentName, requiresE2E, dshEnabled });
     process.on('SIGINT', () => { agent.stop(); process.exit(0); });
     process.on('SIGTERM', () => { agent.stop(); process.exit(0); });
