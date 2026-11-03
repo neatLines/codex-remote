@@ -16,6 +16,7 @@ import {
 } from './crypto-auth.mjs';
 import { acceptWebSocketUpgrade } from './ws-minimal.mjs';
 import { createDshProxy } from './dsh-proxy.mjs';
+import { createFileStore } from './file-store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -253,6 +254,14 @@ export function createCloudServer(options = {}) {
     isTrusted: (agentId) => Boolean(authStore.state.trustedAgents[agentId]),
     publicOrigin: env.CODEX_PUBLIC_ORIGIN,
   });
+  const fileStore = createFileStore({ dataDir, env, authStore, isAuthenticated: isRequestAuthenticated,
+    onChange: (file) => broadcastToClients({ type: 'relay/filesChanged', file }),
+  });
+
+  function sendUploadCredentials(agentId, ws, options) {
+    const credentials = fileStore.issueCredentials(agentId, options);
+    if (credentials) ws.send(credentials);
+  }
 
   const server = tlsEnabled
     ? https.createServer({
@@ -404,9 +413,11 @@ export function createCloudServer(options = {}) {
         };
         if (live) {
           live.ws.send({ type: 'relay/trusted', trusted: true });
+          if (live.fileUploads) sendUploadCredentials(agentId, live.ws, { reset: true });
         }
       } else {
         delete authStore.state.trustedAgents[agentId];
+        fileStore.revoke(agentId);
         dshProxy.revoke(agentId);
         if (live) {
           live.ws.send({ type: 'relay/trusted', trusted: false });
@@ -422,6 +433,7 @@ export function createCloudServer(options = {}) {
       return;
     }
 
+    if (await fileStore.handleHttp(req, res)) return;
     if (dshProxy.handleHttp(req, res)) return;
 
     // 6. Serve Static Assets
@@ -581,6 +593,7 @@ export function createCloudServer(options = {}) {
             defaultCwd: String(msg.defaultCwd || ''),
             profile: msg.profile ? String(msg.profile) : null,
             requiresE2E: Boolean(msg.requiresE2E),
+            fileUploads: msg.fileUploads === true,
             e2eKeyFingerprint: msg.e2eKeyFingerprint ? String(msg.e2eKeyFingerprint) : null,
             connectedAt: Date.now(),
             dshWeb: { enabled: msg.dshWeb?.enabled === true,
@@ -609,6 +622,9 @@ export function createCloudServer(options = {}) {
             agentId,
             trusted: isTrusted,
           });
+          if (isTrusted && agentInfo.fileUploads) {
+            sendUploadCredentials(agentId, ws, { token: msg.fileUploadToken, allowCreate: true });
+          }
 
           broadcastAgentsUpdate();
           return;
@@ -715,6 +731,7 @@ export function createCloudServer(options = {}) {
     },
     async close() {
       clearInterval(pingTimer);
+      fileStore.close();
       dshProxy.close();
       for (const c of clients) c.ws.close();
       for (const a of agents.values()) a.ws.close();

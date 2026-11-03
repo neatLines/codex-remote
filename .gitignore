@@ -10,6 +10,7 @@
 *.pfx
 auth.json
 remote-agent-identity.json
+remote-agent-upload.json
 
 # Local runtime state and agent tooling
 /data/

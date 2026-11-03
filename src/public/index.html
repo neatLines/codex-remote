@@ -93,6 +93,7 @@
           </div>
         </div>
         <div class="topbar-actions">
+          <button id="btn-files" class="btn-small" title="云端文件">文件</button>
           <a id="btn-dsh-web" class="dsh-link hidden" target="_blank" rel="noopener noreferrer">DSH</a>
           <button id="btn-e2e-key" class="icon-btn" title="配对密钥" aria-label="配对密钥">
             <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -204,6 +205,21 @@
         <button id="btn-select-dir" class="btn-primary">在此目录新建对话</button>
       </div>
     </div>
+  </div>
+
+  <div id="modal-files" class="modal-backdrop hidden">
+    <section class="modal-card modal-large" aria-label="云端文件">
+      <h3>云端文件</h3>
+      <p class="modal-desc">查看 Agent 上传的文件。文件保存在云端，设备离线后仍可下载。</p>
+      <div class="cloud-files-toolbar">
+        <span id="files-storage" class="hint-text"></span>
+        <button id="btn-refresh-files" class="btn-small">刷新</button>
+      </div>
+      <div id="files-status" class="hint-text" role="status" aria-live="polite"></div>
+      <div id="files-list" class="cloud-files-list"></div>
+      <button id="btn-more-files" class="btn-ghost hidden">加载更多文件</button>
+      <div class="modal-actions"><button id="btn-close-files" class="btn-ghost">关闭</button></div>
+    </section>
   </div>
 
   <script type="module" src="/app.js"></script>

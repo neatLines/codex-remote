@@ -118,6 +118,7 @@ const state = {
   threadViews: new Map(),
   currentView: null,
   collapsedWorkspaces: new Set(),
+  files: { items: [], nextCursor: null, request: 0, loading: false },
 };
 
 const EFFORT_LABELS = {
@@ -153,6 +154,14 @@ const el = {
   btnE2EKey: document.getElementById('btn-e2e-key'),
   btnDshWeb: document.getElementById('btn-dsh-web'),
   btnNewThread: document.getElementById('btn-new-thread'),
+  btnFiles: document.getElementById('btn-files'),
+  modalFiles: document.getElementById('modal-files'),
+  filesList: document.getElementById('files-list'),
+  filesStatus: document.getElementById('files-status'),
+  filesStorage: document.getElementById('files-storage'),
+  btnRefreshFiles: document.getElementById('btn-refresh-files'),
+  btnMoreFiles: document.getElementById('btn-more-files'),
+  btnCloseFiles: document.getElementById('btn-close-files'),
   untrustedBanner: document.getElementById('untrusted-banner'),
   e2eBanner: document.getElementById('e2e-banner'),
   btnBannerE2E: document.getElementById('btn-banner-e2e'),
@@ -421,6 +430,10 @@ function connectRelayWebSocket() {
 
     if (msg.type === 'relay/rpc') {
       handleIncomingCodexPayload(msg.payload, msg.agentId);
+      return;
+    }
+    if (msg.type === 'relay/filesChanged') {
+      if (!el.modalFiles.classList.contains('hidden')) loadCloudFiles();
       return;
     }
 
@@ -1504,7 +1517,60 @@ function formatRelativeTime(ms) {
   return `${Math.floor(diffSec / 86400)}天前`;
 }
 
+function formatFileBytes(value) {
+  let bytes = Number(value) || 0, index = 0;
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  while (bytes >= 1024 && index < units.length - 1) { bytes /= 1024; index++; }
+  return `${index ? bytes.toFixed(1) : bytes} ${units[index]}`;
+}
+
+function renderCloudFiles() {
+  el.filesList.replaceChildren();
+  for (const file of state.files.items) {
+    if (!/^[a-f0-9]{32}$/.test(file.id)) continue;
+    const row = document.createElement('div'); row.className = 'cloud-file-row';
+    const info = document.createElement('div'); info.className = 'cloud-file-info';
+    const name = document.createElement('div'); name.className = 'cloud-file-name'; name.textContent = file.name;
+    const metadata = document.createElement('div'); metadata.className = 'cloud-file-meta';
+    metadata.textContent = `${formatFileBytes(file.size)} · ${file.agentName || 'Agent'} · ${new Date(file.createdAt).toLocaleString()}`;
+    const download = document.createElement('a'); download.className = 'btn-small cloud-file-download';
+    download.href = `/api/files/${file.id}/download`; download.download = file.name; download.textContent = '下载';
+    info.appendChild(name); info.appendChild(metadata); row.appendChild(info); row.appendChild(download);
+    el.filesList.appendChild(row);
+  }
+  el.btnMoreFiles.classList.toggle('hidden', !state.files.nextCursor);
+}
+
+async function loadCloudFiles({ more = false } = {}) {
+  if (more && (state.files.loading || !state.files.nextCursor)) return;
+  const request = ++state.files.request;
+  state.files.loading = true;
+  el.btnMoreFiles.disabled = true;
+  el.filesStatus.textContent = '正在加载文件…';
+  try {
+    const cursor = more ? `&cursor=${encodeURIComponent(state.files.nextCursor)}` : '';
+    const response = await fetch(`/api/files?limit=50${cursor}`, { cache: 'no-store' });
+    const data = await response.json();
+    if (request !== state.files.request) return;
+    if (!response.ok || !data.ok) throw new Error(response.status === 401 ? '登录已过期，请重新登录后访问文件' : data.error || '加载文件失败');
+    const files = new Map((more ? state.files.items : []).map((file) => [file.id, file]));
+    for (const file of data.files || []) files.set(file.id, file);
+    state.files.items = [...files.values()]; state.files.nextCursor = data.nextCursor || null;
+    el.filesStorage.textContent = data.storage ? `已用 ${formatFileBytes(data.storage.usedBytes)} / ${formatFileBytes(data.storage.maxBytes)}` : '';
+    renderCloudFiles();
+    el.filesStatus.textContent = state.files.items.length ? '' : '暂无文件。Agent 上传后会显示在这里。';
+  } catch (error) {
+    if (request === state.files.request) el.filesStatus.textContent = error.message;
+  } finally {
+    if (request === state.files.request) { state.files.loading = false; el.btnMoreFiles.disabled = false; }
+  }
+}
+
 // === Event Bindings ===
+el.btnFiles.onclick = () => { el.modalFiles.classList.remove('hidden'); loadCloudFiles(); };
+el.btnCloseFiles.onclick = () => el.modalFiles.classList.add('hidden');
+el.btnRefreshFiles.onclick = () => loadCloudFiles();
+el.btnMoreFiles.onclick = () => loadCloudFiles({ more: true });
 el.loginForm.onsubmit = async (e) => {
   e.preventDefault();
   el.loginError.classList.add('hidden');

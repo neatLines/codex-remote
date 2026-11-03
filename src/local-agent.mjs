@@ -8,6 +8,7 @@ import { E2EVerifier } from './crypto-auth.mjs';
 import { AgentInteractions } from './agent-interactions.mjs';
 import { connectWebSocketClient } from './ws-minimal.mjs';
 import { startManagedDsh, createDshAgentBridge } from './dsh-web.mjs';
+import { clearUploadCredentials, registrationUploadToken, saveUploadCredentials, uploadAgentFile } from './file-upload.mjs';
 
 const READ_ONLY_METHODS = new Set([
   'remote/getWorkspacesAndThreads',
@@ -806,6 +807,8 @@ export function startLocalAgent(options = {}) {
         profile: currentProfile,
         requiresE2E,
         e2eKeyFingerprint: identity.e2eKeyFingerprint,
+        fileUploads: true,
+        fileUploadToken: registrationUploadToken(codexHome, relayUrl, identity.agentId),
       });
 
       ws.on('message', (raw) => {
@@ -820,6 +823,7 @@ export function startLocalAgent(options = {}) {
         if (dshBridge.handle(msg)) return;
 
         if (msg.type === 'relay/registered') {
+          if (!msg.trusted) clearUploadCredentials(codexHome, relayUrl);
           publishAgentState();
           if (!options.quiet) {
             console.log(
@@ -832,9 +836,16 @@ export function startLocalAgent(options = {}) {
         }
 
         if (msg.type === 'relay/trusted') {
+          if (!msg.trusted) clearUploadCredentials(codexHome, relayUrl);
           if (!options.quiet) {
             console.log(`🔒 Device trust updated by mobile user: ${msg.trusted ? 'TRUSTED' : 'UNTRUSTED'}`);
           }
+          return;
+        }
+
+        if (msg.type === 'relay/fileUploadCredentials') {
+          try { saveUploadCredentials(codexHome, relayUrl, identity.agentId, msg); }
+          catch { if (!options.quiet) console.warn('[local-agent] 无法保存文件上传凭据，请检查本机配置目录权限'); }
           return;
         }
 
@@ -911,14 +922,17 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   let agentName = process.env.CODEX_AGENT_NAME;
   let requiresE2E = process.env.CODEX_DISABLE_E2E !== '1';
   let dshEnabled = process.env.CODEX_DSH_ENABLED !== '0';
+  let threadId;
+  let uploadName;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--relay' && args[i + 1]) relayUrl = args[++i];
     else if ((args[i] === '--profile' || args[i] === '-p') && args[i + 1]) profile = args[++i];
-    else if (args[i] === '--name' && args[i + 1]) agentName = args[++i];
+    else if (args[i] === '--name' && args[i + 1]) { agentName = args[++i]; uploadName = agentName; }
     else if (args[i] === '--no-e2e') requiresE2E = false;
     else if (args[i] === '--no-dsh') dshEnabled = false;
     else if (args[i] === '--dsh') dshEnabled = true;
+    else if (args[i] === '--thread-id' && args[i + 1]) threadId = args[++i];
   }
 
   if (args.includes('--show-pairing-key')) {
@@ -926,13 +940,18 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     console.log(identity.localSigningKey);
     process.exit(0);
   }
-  const agent = startLocalAgent({ relayUrl, profile, agentName, requiresE2E, dshEnabled });
-  process.on('SIGINT', () => {
-    agent.stop();
-    process.exit(0);
-  });
-  process.on('SIGTERM', () => {
-    agent.stop();
-    process.exit(0);
-  });
+  if (args.includes('--upload')) {
+    const filePath = args[args.indexOf('--upload') + 1];
+    try {
+      if (!filePath || filePath.startsWith('--')) throw new Error('用法：codex-up --upload 文件路径 [--name 下载文件名] [--thread-id 会话ID]');
+      const file = await uploadAgentFile(filePath, { relayUrl, name: uploadName, threadId });
+      console.log(JSON.stringify({ ok: true, file }));
+    } catch (error) {
+      console.error(error.message); process.exitCode = 1;
+    }
+  } else {
+    const agent = startLocalAgent({ relayUrl, profile, agentName, requiresE2E, dshEnabled });
+    process.on('SIGINT', () => { agent.stop(); process.exit(0); });
+    process.on('SIGTERM', () => { agent.stop(); process.exit(0); });
+  }
 }

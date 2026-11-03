@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { createCloudServer } from '../src/cloud-server.mjs';
 import { generateTotpCode } from '../src/crypto-auth.mjs';
 import { startLocalAgent } from '../src/local-agent.mjs';
+import { uploadAgentFile, uploadCredentialsPath } from '../src/file-upload.mjs';
 import { connectWebSocketClient, MinimalWebSocket } from '../src/ws-minimal.mjs';
 
 function requestHttps(port, ca, requestPath, options = {}) {
@@ -18,7 +19,7 @@ function requestHttps(port, ca, requestPath, options = {}) {
     const req = https.request({
       hostname: '127.0.0.1', port, path: requestPath, ca,
       method: body ? 'POST' : 'GET',
-      headers: body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } : {},
+      headers: { ...(body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } : {}), ...options.headers },
       ...(options.servername ? { servername: options.servername } : {}),
     }, (response) => {
       let text = '';
@@ -96,6 +97,16 @@ test('HTTPS, secure login cookies, verified WSS and the local agent work with a 
       req.on('error', reject); req.end(body);
     });
     assert.equal(trust, 200);
+    const codexHome = path.join(directory, 'agent');
+    for (let attempt = 0; attempt < 100 && !fs.existsSync(uploadCredentialsPath(codexHome)); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const source = path.join(directory, 'upload.txt'); fs.writeFileSync(source, 'verified TLS file upload');
+    await assert.rejects(uploadAgentFile(source, { codexHome, relayUrl: `${url}/ws/agent`, relayCaFile: '' }), /self.signed certificate/i);
+    const uploaded = await uploadAgentFile(source, { codexHome, relayUrl: `${url}/ws/agent`, relayCaFile: cert });
+    const downloaded = await requestHttps(port, ca, uploaded.downloadUrl, { headers: { Cookie: cookie } });
+    assert.equal(downloaded.status, 200);
+    assert.equal(downloaded.body, 'verified TLS file upload');
     client = await connectWebSocketClient(`${url}/ws/client`, { ca, headers: { Cookie: cookie } });
     const result = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('WSS RPC did not complete')), 5000);

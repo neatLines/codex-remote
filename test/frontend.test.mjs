@@ -76,7 +76,7 @@ class Element {
   }
 }
 
-function setup() {
+function setup(options = {}) {
   const nodes = new Map();
   const timers = new Map();
   const sent = [];
@@ -88,6 +88,7 @@ function setup() {
     }, createElement: (tag) => new Element(false, tag), createDocumentFragment: () => new Element(true), body: new Element() },
     localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
     window: { innerWidth: 1000 }, WebSocket: { OPEN: 1 }, TextEncoder,
+    fetch: options.fetch,
     setTimeout: (fn) => { const id = {}; timers.set(id, fn); return id; },
     clearTimeout: (id) => timers.delete(id), console: { warn() {} },
     renderMarkdown: (node, text) => { node.textContent = text; node.markdownRenders = (node.markdownRenders || 0) + 1; },
@@ -97,7 +98,7 @@ function setup() {
   const interactions = fs.readFileSync(new URL('../src/public/interactions.js', import.meta.url), 'utf8')
     .replace(/^import .*;$/gm, '').replace(/^export /gm, '');
   source = interactions + '\n' + source;
-  vm.runInContext(source + '\nglobalThis.app = { state, el, getThreadView, createThreadView, activateThreadView, openExistingThread, startNewThreadInWorkspace, sendUserPrompt, handleIncomingCodexPayload, rejectPendingRpc, syncThreadControls, applyAgentState, submitInteraction, loadThreadHistory, loadWorkspacesAndThreads, renderThreadItem, syncAgentState, renderWorkspacesDrawer };', context);
+  vm.runInContext(source + '\nglobalThis.app = { state, el, getThreadView, createThreadView, activateThreadView, openExistingThread, startNewThreadInWorkspace, sendUserPrompt, handleIncomingCodexPayload, rejectPendingRpc, syncThreadControls, applyAgentState, submitInteraction, loadThreadHistory, loadWorkspacesAndThreads, renderThreadItem, syncAgentState, renderWorkspacesDrawer, loadCloudFiles };', context);
   const app = context.app;
   app.state.selectedAgentId = 'agent';
   app.state.agents = [{ agentId: 'agent', online: true, trusted: true }];
@@ -799,4 +800,40 @@ test('history can fill a gap after a long disconnect without reversing already c
   app.respond(app.sent[4], history('turn', [agent('old', 'old'), agent('middle', 'middle')])); await loading;
   assert.equal(view.messages.textContent, 'oldmiddlenew');
   assert.equal(view.historyCursor, null);
+});
+
+test('cloud files render untrusted names as text and downloads always use authenticated same-origin routes', async () => {
+  const id = 'a'.repeat(32);
+  const filename = '<img src=x onerror=alert(1)>.html';
+  const calls = [];
+  const app = setup({ fetch: async (url) => {
+    calls.push(url);
+    return { ok: true, json: async () => ({ ok: true, files: [{ id, name: filename, size: 2500, createdAt: Date.now(),
+      agentName: '<b>Agent</b>', downloadUrl: 'https://evil.test/leak' }], nextCursor: 'next', storage: { usedBytes: 2500, maxBytes: 10000 } }) };
+  } });
+  await app.loadCloudFiles();
+  const link = app.el.filesList.querySelector('a');
+  assert.equal(link.href, `/api/files/${id}/download`);
+  assert.equal(link.download, filename);
+  assert.equal(app.el.filesList.querySelector('.cloud-file-name').textContent, filename);
+  assert.equal(app.el.filesList.querySelectorAll('img').length, 0);
+  assert.equal(app.el.btnMoreFiles.classList.contains('hidden'), false);
+  await app.loadCloudFiles({ more: true });
+  assert.match(calls[1], /cursor=next/);
+  assert.equal(app.el.filesList.querySelectorAll('a').length, 1, 'Pagination deduplicates entries');
+});
+
+test('cloud file refresh ignores stale replies and reports expired login without replacing chat state', async () => {
+  const pending = [];
+  const app = setup({ fetch: () => new Promise((resolve) => pending.push(resolve)) });
+  const first = app.loadCloudFiles(), second = app.loadCloudFiles();
+  pending[1]({ ok: true, json: async () => ({ ok: true, files: [], nextCursor: null }) }); await second;
+  pending[0]({ ok: true, json: async () => ({ ok: true, files: [{ id: 'b'.repeat(32), name: 'stale' }] }) }); await first;
+  assert.equal(app.state.files.items.length, 0);
+  const current = app.state.currentView;
+  const expired = app.loadCloudFiles();
+  pending[2]({ ok: false, status: 401, json: async () => ({ ok: false }) }); await expired;
+  assert.match(app.el.filesStatus.textContent, /登录已过期/);
+  assert.equal(app.state.currentView, current);
+  assert.equal(app.state.files.loading, false);
 });
