@@ -1,0 +1,137 @@
+name: codex-remote
+
+services:
+  gateway:
+    image: codex-remote-gateway:${REMOTE_IMAGE_TAG:-local}
+    pull_policy: never
+    build:
+      context: ../..
+      dockerfile: deploy/docker/gateway.Dockerfile
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da}
+    user: ${REMOTE_UID:-1000}:${REMOTE_GID:-1000}
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+    stop_grace_period: 20s
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    ports:
+      - "${REMOTE_BIND_IP:-0.0.0.0}:${REMOTE_HTTPS_PORT:-443}:8443"
+      - "${REMOTE_BIND_IP:-0.0.0.0}:${REMOTE_HTTP_PORT:-80}:8080"
+    environment:
+      TZ: Asia/Shanghai
+      CODEX_CLOUD_HOST: 0.0.0.0
+      CODEX_CLOUD_PORT: '8443'
+      CODEX_HTTP_REDIRECT_PORT: '8080'
+      CODEX_PUBLIC_ORIGIN: ${REMOTE_PUBLIC_ORIGIN:?Set the existing HTTPS origin}
+      CODEX_DATA_DIR: /data
+      CODEX_TLS_CERT_FILE: /run/tls/server.crt
+      CODEX_TLS_KEY_FILE: /run/tls/server.key
+      CODEX_HEALTH_CA_FILE: /run/remote-ca.crt
+    volumes:
+      - type: bind
+        source: ${REMOTE_DATA_DIR:?Set the existing gateway data directory}
+        target: /data
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${REMOTE_TLS_DIR:?Set the existing TLS directory}
+        target: /run/tls
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${REMOTE_CA_FILE:?Set the existing CA certificate}
+        target: /run/remote-ca.crt
+        read_only: true
+        bind: {create_host_path: false}
+    healthcheck:
+      test: [CMD, node, /app/deploy/docker/healthcheck.mjs, gateway]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      start_interval: 2s
+      retries: 3
+    logging: &logging
+      driver: json-file
+      options: {max-size: 10m, max-file: '3'}
+
+  opencode:
+    image: codex-remote-opencode:${REMOTE_IMAGE_TAG:-local}
+    pull_policy: never
+    build:
+      context: ../..
+      dockerfile: deploy/docker/opencode.Dockerfile
+      additional_contexts:
+        opencode_binary: ${OPENCODE_BINARY_DIR:?Set the directory containing the verified OpenCode 2.0.32 binary}
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22.23.4-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da}
+        OPENCODE_UID: ${OPENCODE_UID:-1002}
+        OPENCODE_GID: ${OPENCODE_GID:-1002}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-http://deb.debian.org}
+    depends_on:
+      gateway: {condition: service_healthy}
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 2
+    mem_limit: 1536m
+    pids_limit: 256
+    stop_grace_period: 20s
+    # Bun extracts native PTY/watcher libraries here and must be able to map executable code.
+    tmpfs: ["/tmp:size=256m,mode=1777,exec"]
+    environment:
+      TZ: Asia/Shanghai
+      CODEX_AGENT_NAME: ${REMOTE_AGENT_NAME:-上海服务器}
+      CODEX_RELAY_URL: ${REMOTE_RELAY_URL:?Set the existing WSS agent URL}
+      CODEX_RELAY_CA_FILE: /run/remote-ca.crt
+      CODEX_OPENCODE_BIN: /usr/local/bin/opencode
+      CODEX_OPENCODE_PORT: '3082'
+      CODEX_WEB_SERVICES_FILE: ${OPENCODE_SERVICES_FILE:-/home/opencode/.config/opencode/remote-services.json}
+    volumes:
+      - opencode-home:/home/opencode
+      - type: bind
+        source: ${OPENCODE_HOME_DIR:?Set the existing OpenCode home}/workspaces
+        target: /home/opencode/workspaces
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${OPENCODE_HOME_DIR}/.codex
+        target: /home/opencode/.codex
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${OPENCODE_HOME_DIR}/.config/opencode
+        target: /home/opencode/.config/opencode
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${OPENCODE_HOME_DIR}/.local/share/opencode
+        target: /home/opencode/.local/share/opencode
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${OPENCODE_HOME_DIR}/.local/state/opencode
+        target: /home/opencode/.local/state/opencode
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${OPENCODE_HOME_DIR}/.cache/opencode
+        target: /home/opencode/.cache/opencode
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${REMOTE_CA_FILE}
+        target: /run/remote-ca.crt
+        read_only: true
+        bind: {create_host_path: false}
+    healthcheck:
+      test: [CMD, node, /app/deploy/docker/healthcheck.mjs, opencode]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      start_interval: 2s
+      retries: 3
+    logging: *logging
+
+volumes:
+  opencode-home:

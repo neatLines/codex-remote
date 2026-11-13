@@ -22,7 +22,7 @@
           </svg>
         </div>
         <h1>Codex Remote</h1>
-        <p class="subtitle">连接设备上的 Codex、DSH 与 OpenCode</p>
+        <p class="subtitle">连接设备上的应用与桌面</p>
       </div>
       <form id="login-form" autocomplete="on">
         <div class="field">
@@ -123,7 +123,21 @@
       <section id="device-apps" class="device-apps" aria-labelledby="device-apps-title">
         <h1 id="device-apps-title">设备应用</h1>
         <p id="device-apps-status" role="status"></p>
+        <section id="device-foundation" class="device-foundation">
+          <h2>基础能力</h2>
+          <div id="base-app-cards" class="app-cards"></div>
+        </section>
+        <h2 id="device-services-title" class="device-services-title">网页服务</h2>
         <div id="app-cards" class="app-cards"></div>
+        <form id="local-web-form" class="local-web-form hidden">
+          <h2>本地网页</h2>
+          <label for="local-web-url">端口或本地网址</label>
+          <div class="local-web-controls">
+            <input id="local-web-url" type="text" placeholder="9090 或 http://127.0.0.1:9090/ui/#/overview" autocomplete="off" spellcheck="false" />
+            <button id="local-web-open" type="submit" class="btn-small">打开网页 ↗</button>
+          </div>
+          <p id="local-web-error" role="status">通过当前设备转发，需登录并信任设备。</p>
+        </form>
       </section>
       <main id="chat-container" class="chat-container">
         <div id="chat-empty" class="chat-empty">

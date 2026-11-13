@@ -1,16 +1,20 @@
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { E2EVerifier } from './crypto-auth.mjs';
 import { AgentInteractions } from './agent-interactions.mjs';
-import { connectWebSocketClient } from './ws-minimal.mjs';
+import { connectRelayTransport } from './relay-transport.mjs';
 import { startManagedDsh, createDshAgentBridge } from './dsh-web.mjs';
 import { clearUploadCredentials, registrationUploadToken, saveUploadCredentials, uploadAgentFile } from './file-upload.mjs';
 import { waitForPreviousAgent } from './agent-process.mjs';
 import { startManagedOpenCode, openCodeRewriter } from './opencode-web.mjs';
+import { startManagedDesktop } from './desktop-web.mjs';
+import { localWebRewriter } from './local-web.mjs';
+import { readWebServices, normalizeWebServices } from './web-services.mjs';
 
 const READ_ONLY_METHODS = new Set([
   'remote/getWorkspacesAndThreads',
@@ -122,6 +126,7 @@ export function readDesktopGlobalWorkspaces(codexHome = path.join(os.homedir(), 
  * @param {{
  *   relayUrl?: string,
  *   relayCaFile?: string,
+ *   relayTransport?: 'auto' | 'poll' | 'websocket',
  *   dshEnabled?: boolean,
  *   dshBin?: string,
  *   dshPort?: number,
@@ -131,6 +136,15 @@ export function readDesktopGlobalWorkspaces(codexHome = path.join(os.homedir(), 
  *   opencodeBin?: string,
  *   opencodePort?: number,
  *   opencodeCwd?: string,
+ *   desktopEnabled?: boolean,
+ *   localWebEnabled?: boolean,
+ *   webServices?: Array<object>,
+ *   webServicesFile?: string,
+ *   wayvncBin?: string,
+ *   websockifyBin?: string,
+ *   novncDir?: string,
+ *   desktopOutput?: string,
+ *   desktopFps?: number,
  *   codexBin?: string,
  *   codexHome?: string,
  *   profile?: string | null,
@@ -144,7 +158,12 @@ export function readDesktopGlobalWorkspaces(codexHome = path.join(os.homedir(), 
  */
 export function startLocalAgent(options = {}) {
   const codexEnabled = options.codexEnabled ?? (process.env.CODEX_CODEX_ENABLED !== '0');
-  const opencodeEnabled = options.opencodeEnabled ?? (process.env.CODEX_OPENCODE_ENABLED === '1');
+  const servicesFile = options.webServicesFile || process.env.CODEX_WEB_SERVICES_FILE;
+  let services = options.webServices !== undefined ? normalizeWebServices(options.webServices) : servicesFile ? readWebServices(servicesFile) : undefined;
+  const serviceOf = kind => services?.find(service => service.kind === kind);
+  const opencodeEnabled = services ? Boolean(serviceOf('opencode')) : options.opencodeEnabled ?? (process.env.CODEX_OPENCODE_ENABLED === '1');
+  const desktopEnabled = options.desktopEnabled ?? (process.env.CODEX_DESKTOP_ENABLED === '1');
+  const localWebEnabled = services ? services.length > 0 : options.localWebEnabled ?? (process.env.CODEX_LOCAL_WEB_ENABLED === '1');
   const codexHome = options.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
   const relayUrl =
     options.relayUrl || process.env.CODEX_RELAY_URL || 'ws://127.0.0.1:3280/ws/agent';
@@ -255,6 +274,79 @@ export function startLocalAgent(options = {}) {
   let reconnectTimer = null;
   let dshManager = null;
   let opencodeManager = null;
+  let desktopManager = null;
+  const httpServiceStates = new Map(), serviceProbes = new Set();
+  function registeredServices() {
+    return services?.map(service => ({ ...service,
+      status: service.kind === 'dsh' ? dshManager?.status.status || 'starting' : service.kind === 'opencode' ? opencodeManager?.status.status || 'starting' : httpServiceStates.get(service.port) || 'starting',
+      ...(service.kind === 'dsh' && dshManager?.credentials ? { auth: { ...service.auth, token: dshManager.credentials.token,
+        headers: { ...service.auth?.headers, cookie: dshManager.credentials.cookie } } } : {}),
+      ...(service.kind === 'opencode' && opencodeManager?.credentials ? { auth: { ...service.auth,
+        headers: { ...service.auth?.headers, authorization: opencodeManager.credentials.authorization } } } : {}),
+    }));
+  }
+  const nativeServicesFile = path.join(codexHome, 'remote-native-services.json');
+  function saveNativeServices() {
+    if (!services) return;
+    const entries = services.filter(service => service.kind !== 'http').map(service => {
+      const url = new URL(`http://127.0.0.1:${service.port}/`);
+      if (service.kind === 'dsh' && dshManager?.credentials) url.searchParams.set('token', dshManager.credentials.token);
+      return { id: service.id, name: service.name, url: url.href,
+        ...(service.kind === 'opencode' && opencodeManager?.credentials ? { username: opencodeManager.credentials.username, password: opencodeManager.credentials.password } : {}),
+        status: service.kind === 'dsh' ? dshManager?.status.status || 'starting' : opencodeManager?.status.status || 'starting' };
+    });
+    const temporary = nativeServicesFile + '.' + crypto.randomBytes(6).toString('hex');
+    fs.writeFileSync(temporary, JSON.stringify(entries, null, 2) + '\n', { mode: 0o600 }); fs.renameSync(temporary, nativeServicesFile);
+  }
+  function publishServices() { if (services) { saveNativeServices(); activeWs?.send({ type: 'agent/services', webServices: registeredServices() }); } }
+  function probeServices() {
+    for (const service of services || []) {
+      if (service.kind !== 'http') continue;
+      const socket = net.connect({ host: '127.0.0.1', port: service.port }); serviceProbes.add(socket);
+      let settled = false;
+      const finish = status => {
+        if (settled) return; settled = true; socket.destroy(); serviceProbes.delete(socket);
+        if (stopped || !services.some(entry => entry.port === service.port) || httpServiceStates.get(service.port) === status) return;
+        httpServiceStates.set(service.port, status); publishServices();
+      };
+      socket.setTimeout(1000, () => finish('error')); socket.once('connect', () => finish('ready')); socket.once('error', () => finish('error'));
+    }
+  }
+  const managedSignature = list => JSON.stringify(list.filter(service => service.kind !== 'http').map(({ id, kind, port }) => ({ id, kind, port })));
+  const reloadServices = () => {
+    try {
+      const next = readWebServices(servicesFile);
+      if (JSON.stringify(next) === JSON.stringify(services)) return;
+      if (managedSignature(next) !== managedSignature(services)) throw new Error('托管应用的启动配置变化，请重启 Agent');
+      services = next; publishServices(); probeServices();
+      if (!options.quiet) console.log('[web-services] Service spec reloaded');
+    } catch { if (!options.quiet) console.warn('[web-services] Spec not applied; check JSON/schema, or restart Agent after changing managed application startup settings'); }
+  };
+  if (servicesFile && options.webServices === undefined) fs.watchFile(servicesFile, { interval: 2000, persistent: false }, reloadServices);
+  const serviceProbeTimer = services ? setInterval(probeServices, 5000) : null; serviceProbeTimer?.unref();
+  if (services) probeServices();
+  const localBridge = createDshAgentBridge({ service: 'local', getTarget: (message) => {
+    if (!localWebEnabled || !Number.isInteger(message.port) || message.port < 1 || message.port > 65535) throw new Error('Invalid local web port');
+    const service = services?.find(entry => entry.port === message.port);
+    if (services && !service) throw new Error('Local web service is not registered');
+    return { base: `http://127.0.0.1:${message.port}`, rewriteResponse: service?.kind === 'opencode'
+      ? openCodeRewriter(identity.agentId, { prefix: `/local/${identity.agentId}/${message.port}` }) : localWebRewriter(identity.agentId, message.port) };
+  } });
+  const desktopBridge = createDshAgentBridge({ service: 'desktop', getTarget: async () => {
+    if (!desktopManager) throw new Error('Desktop is disabled');
+    return desktopManager.target();
+  } });
+  if (desktopEnabled) {
+    desktopManager = startManagedDesktop({ agentId: identity.agentId,
+      wayvncBin: options.wayvncBin || process.env.CODEX_WAYVNC_BIN || 'wayvnc',
+      websockifyBin: options.websockifyBin || process.env.CODEX_WEBSOCKIFY_BIN || 'websockify',
+      novncDir: options.novncDir || process.env.CODEX_NOVNC_DIR || '/usr/share/novnc',
+      output: options.desktopOutput || process.env.CODEX_DESKTOP_OUTPUT,
+      fps: Number(options.desktopFps ?? process.env.CODEX_DESKTOP_FPS ?? 12), quiet: options.quiet,
+      onStatus: (desktopWeb) => activeWs?.send({ type: 'agent/desktop_status', desktopWeb }),
+      onRestart: () => desktopBridge.disconnect(true),
+    });
+  }
   const opencodeBridge = createDshAgentBridge({ service: 'opencode', rewriteResponse: openCodeRewriter(identity.agentId),
     getTarget: async () => {
       if (!opencodeManager) throw new Error('OpenCode is disabled');
@@ -264,14 +356,15 @@ export function startLocalAgent(options = {}) {
   if (opencodeEnabled) {
     opencodeManager = startManagedOpenCode({
       bin: options.opencodeBin || process.env.CODEX_OPENCODE_BIN || 'opencode',
-      port: Number(options.opencodePort ?? process.env.CODEX_OPENCODE_PORT ?? 3082),
+      port: serviceOf('opencode')?.port ?? Number(options.opencodePort ?? process.env.CODEX_OPENCODE_PORT ?? 3082),
+      passwordRequired: !services,
       cwd: options.opencodeCwd || process.env.CODEX_OPENCODE_CWD || defaultCwd,
       quiet: options.quiet,
-      onStatus: (opencodeWeb) => activeWs?.send({ type: 'agent/opencode_status', opencodeWeb }),
-      onRestart: () => opencodeBridge.disconnect(true),
+      onStatus: (opencodeWeb) => { activeWs?.send({ type: 'agent/opencode_status', opencodeWeb }); publishServices(); },
+      onRestart: () => { opencodeBridge.disconnect(true); localBridge.disconnect(true, serviceOf('opencode')?.port); },
     });
   }
-  const dshEnabled = options.dshEnabled ?? process.env.CODEX_DSH_ENABLED === '1';
+  const dshEnabled = services ? Boolean(serviceOf('dsh')) : options.dshEnabled ?? process.env.CODEX_DSH_ENABLED === '1';
   const dshBridge = createDshAgentBridge({ getTarget: async () => {
     if (!dshManager) throw new Error('DSH Web is disabled');
     return dshManager.target();
@@ -281,11 +374,11 @@ export function startLocalAgent(options = {}) {
     const publicUrl = `${relay.protocol === 'wss:' ? 'https:' : 'http:'}//${relay.host}/dsh/${identity.agentId}/`;
     dshManager = startManagedDsh({
       bin: options.dshBin || process.env.CODEX_DSH_BIN || 'dsh',
-      port: Number(options.dshPort ?? process.env.CODEX_DSH_PORT ?? 3081),
+      port: serviceOf('dsh')?.port ?? Number(options.dshPort ?? process.env.CODEX_DSH_PORT ?? 3081),
       cwd: options.dshCwd || process.env.CODEX_DSH_CWD || os.homedir(),
-      publicUrl, quiet: options.quiet,
-      onStatus: (dshWeb) => activeWs?.send({ type: 'agent/dsh_status', dshWeb }),
-      onRestart: () => dshBridge.disconnect(true),
+      publicUrl: services ? undefined : publicUrl, quiet: options.quiet,
+      onStatus: (dshWeb) => { activeWs?.send({ type: 'agent/dsh_status', dshWeb }); publishServices(); },
+      onRestart: () => { dshBridge.disconnect(true); localBridge.disconnect(true, serviceOf('dsh')?.port); },
     });
   }
 
@@ -755,7 +848,9 @@ export function startLocalAgent(options = {}) {
       return;
     }
 
-    // On-demand lightweight resume before turn/start (with auto-fork fallback if Desktop App holds writer lock)
+    // Resume only unloaded threads. A freshly started thread is already in memory,
+    // but its rollout is not persisted until the first turn, so resume would fail.
+    // Keep the auto-fork fallback when Desktop App holds a historical thread's writer lock.
     if (payload.method === 'turn/start' && payload.params?.threadId) {
       const startToken = {};
       pendingTurnStarts.add(startToken);
@@ -766,7 +861,14 @@ export function startLocalAgent(options = {}) {
       let targetThreadId = payload.params.threadId;
       try {
         try {
-          await sendInternalRpc('thread/resume', { threadId: targetThreadId, excludeTurns: true });
+          let loaded = false, cursor;
+          do {
+            const page = await sendInternalRpc('thread/loaded/list', { cursor, limit: 100 });
+            if (!Array.isArray(page?.data)) throw new Error('Codex 未返回已加载的会话列表');
+            loaded = page.data.includes(targetThreadId);
+            cursor = page.nextCursor;
+          } while (!loaded && cursor);
+          if (!loaded) await sendInternalRpc('thread/resume', { threadId: targetThreadId, excludeTurns: true });
         } catch (error) {
           if (!String(error.message).includes('already has an active writer')) throw error;
           const forkRes = await sendInternalRpc('thread/fork', { threadId: targetThreadId, excludeTurns: true });
@@ -826,16 +928,21 @@ export function startLocalAgent(options = {}) {
   async function connectLoop() {
     if (stopped) return;
     try {
-      const ws = await connectWebSocketClient(relayUrl, { ca: relayCa });
+      const ws = await connectRelayTransport(relayUrl, { ca: relayCa, mode: options.relayTransport });
       if (stopped) { ws.close(); return; }
       activeWs = ws;
       dshBridge.attach((message) => ws.send(message));
       opencodeBridge.attach((message) => ws.send(message));
+      desktopBridge.attach((message) => ws.send(message));
+      localBridge.attach((message) => ws.send(message));
 
       ws.send({
         type: 'agent/register',
         dshWeb: dshManager?.status || { enabled: false, status: 'disabled' },
         opencodeWeb: opencodeManager?.status || { enabled: false, status: 'disabled' },
+        desktopWeb: desktopManager?.status || { enabled: false, status: 'disabled' },
+        localWeb: { enabled: localWebEnabled, status: localWebEnabled ? 'ready' : 'disabled' },
+        webServices: registeredServices(),
         codexEnabled,
         codexStatus: serverStatus,
         agentId: identity.agentId,
@@ -861,6 +968,8 @@ export function startLocalAgent(options = {}) {
 
         if (dshBridge.handle(msg)) return;
         if (opencodeBridge.handle(msg)) return;
+        if (desktopBridge.handle(msg)) return;
+        if (localBridge.handle(msg)) return;
 
         if (msg.type === 'relay/registered') {
           if (!msg.trusted) clearUploadCredentials(codexHome, relayUrl);
@@ -895,7 +1004,7 @@ export function startLocalAgent(options = {}) {
       });
 
       ws.on('close', () => {
-        if (activeWs === ws) { activeWs = null; dshBridge.disconnect(); opencodeBridge.disconnect(); }
+        if (activeWs === ws) { activeWs = null; dshBridge.disconnect(); opencodeBridge.disconnect(); desktopBridge.disconnect(); localBridge.disconnect(); }
         if (!stopped) {
           reconnectTimer = setTimeout(connectLoop, 2500);
           reconnectTimer.unref();
@@ -935,24 +1044,33 @@ export function startLocalAgent(options = {}) {
 
   return {
     identity,
+    get connected() { return activeWs?.readyState === 1; },
     get dshStatus() { return dshManager?.status || { enabled: false, status: 'disabled' }; },
     get opencodeStatus() { return opencodeManager?.status || { enabled: false, status: 'disabled' }; },
+    get desktopStatus() { return desktopManager?.status || { enabled: false, status: 'disabled' }; },
     stop() {
       stopped = true;
       dshBridge.disconnect();
       dshManager?.stop();
       opencodeBridge.disconnect();
       opencodeManager?.stop();
+      desktopBridge.disconnect();
+      desktopManager?.stop();
+      localBridge.disconnect();
+      clearInterval(serviceProbeTimer); serviceProbes.forEach(socket => socket.destroy());
+      if (servicesFile) fs.unwatchFile(servicesFile, reloadServices);
+      if (services) fs.rmSync(nativeServicesFile, { force: true });
       if (recycleTimer) clearTimeout(recycleTimer);
       if (processRestartTimer) clearTimeout(processRestartTimer);
       clearProcessRequests('本机 Agent 已停止');
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (activeWs) activeWs.close();
+      const relayClosed = activeWs?.close();
       if (codexProc) {
         const prev = codexProc;
         codexProc = null;
         killCodexProcTree(prev);
       }
+      return relayClosed;
     },
   };
 }
@@ -964,6 +1082,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     console.log('用法：codex-up [--profile 名称] [--name 设备名] [--no-dsh] [--opencode] [--no-codex]\n' +
       '      codex-up --upload 文件路径 [--name 下载名称]\n' +
       '      codex-up --show-pairing-key\n' +
+      '      codex-up --services /path/to/services.json\n' +
+      '      codex-up --show-local-services\n' +
       '      codex-up service install|start|stop|restart|status|logs|uninstall');
     process.exit(0);
   }
@@ -974,6 +1094,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   let dshEnabled = process.env.CODEX_DSH_ENABLED !== '0';
   let codexEnabled = process.env.CODEX_CODEX_ENABLED !== '0';
   let opencodeEnabled = process.env.CODEX_OPENCODE_ENABLED === '1';
+  let desktopEnabled = process.env.CODEX_DESKTOP_ENABLED === '1';
+  let localWebEnabled = process.env.CODEX_LOCAL_WEB_ENABLED === '1';
+  let webServicesFile = process.env.CODEX_WEB_SERVICES_FILE;
   let threadId;
   let uploadName;
 
@@ -987,9 +1110,25 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     else if (args[i] === '--no-codex') codexEnabled = false;
     else if (args[i] === '--opencode') opencodeEnabled = true;
     else if (args[i] === '--no-opencode') opencodeEnabled = false;
+    else if (args[i] === '--desktop') desktopEnabled = true;
+    else if (args[i] === '--no-desktop') desktopEnabled = false;
+    else if (args[i] === '--local-web') localWebEnabled = true;
+    else if (args[i] === '--no-local-web') localWebEnabled = false;
+    else if (args[i] === '--services' && args[i + 1]) webServicesFile = path.resolve(args[++i]);
     else if (args[i] === '--thread-id' && args[i + 1]) threadId = args[++i];
   }
 
+  if (args.includes('--show-local-services')) {
+    const file = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'remote-native-services.json');
+    try {
+      const list = JSON.parse(fs.readFileSync(file, 'utf8'));
+      for (const service of list) {
+        console.log(`${service.name} [${service.status}]: ${service.url}`);
+        if (service.password) console.log(`  username: ${service.username}\n  password: ${service.password}`);
+      }
+    } catch { console.error('没有本机服务信息；请先用服务 spec 启动 Agent'); process.exitCode = 1; }
+    process.exit(process.exitCode || 0);
+  }
   if (args.includes('--show-pairing-key')) {
     const identity = loadOrCreateAgentIdentity(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
     console.log(identity.localSigningKey);
@@ -1007,8 +1146,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   } else {
     try { await waitForPreviousAgent({ wait: args.includes('--service-run') }); }
     catch (error) { console.error(error.message); process.exit(75); }
-    const agent = startLocalAgent({ relayUrl, profile, agentName, requiresE2E, dshEnabled, codexEnabled, opencodeEnabled });
-    process.on('SIGINT', () => { agent.stop(); process.exit(0); });
-    process.on('SIGTERM', () => { agent.stop(); process.exit(0); });
+    const agent = startLocalAgent({ relayUrl, profile, agentName, requiresE2E, dshEnabled, codexEnabled, opencodeEnabled, desktopEnabled, localWebEnabled, webServicesFile });
+    process.on('SIGINT', async () => { await agent.stop(); process.exit(0); });
+    process.on('SIGTERM', async () => { await agent.stop(); process.exit(0); });
   }
 }

@@ -1,0 +1,11 @@
+# Only application code and container entry points belong in the build context.
+# In particular, never send local credentials, databases or TLS keys to Docker.
+**
+!src/
+!src/**
+!package.json
+!LICENSE
+!deploy/
+!deploy/docker/
+!deploy/docker/*.Dockerfile
+!deploy/docker/*.mjs

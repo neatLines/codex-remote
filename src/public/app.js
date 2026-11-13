@@ -1,4 +1,5 @@
 import { renderMarkdown } from './markdown.js';
+import './relay-transport.js';
 import { createInteractionCard } from './interactions.js';
 
 // Pure-JS SHA-256 & HMAC-SHA256 so E2E signing works even on plain HTTP (http://IP:PORT) mobile browsers
@@ -140,6 +141,13 @@ const EFFORT_LABELS = {
 
 // === DOM Elements ===
 const el = {
+  baseAppCards: document.getElementById('base-app-cards'),
+  deviceFoundation: document.getElementById('device-foundation'),
+  deviceServicesTitle: document.getElementById('device-services-title'),
+  localWebForm: document.getElementById('local-web-form'),
+  localWebUrl: document.getElementById('local-web-url'),
+  localWebOpen: document.getElementById('local-web-open'),
+  localWebError: document.getElementById('local-web-error'),
   loginView: document.getElementById('login-view'),
   appView: document.getElementById('app-view'),
   loginForm: document.getElementById('login-form'),
@@ -226,15 +234,23 @@ function renderDeviceApps() {
   const agent = getSelectedAgent();
   const apps = [
     ...(agent && agent.codexEnabled !== false ? [{ id: 'codex', name: 'Codex', status: agent.codexStatus || 'ready' }] : []),
-    ...(agent?.dshWeb?.enabled ? [{ id: 'dsh', name: 'DSH', status: agent.dshWeb.status }] : []),
-    ...(agent?.opencodeWeb?.enabled ? [{ id: 'opencode', name: 'OpenCode', status: agent.opencodeWeb.status }] : []),
+    ...(Array.isArray(agent?.webServices) ? agent.webServices.map(service => ({ ...service,
+      href: `/local/${encodeURIComponent(agent.agentId)}/${service.port}${service.path}` })) : [
+      ...(agent?.dshWeb?.enabled ? [{ id: 'dsh', name: 'DSH', status: agent.dshWeb.status }] : []),
+      ...(agent?.opencodeWeb?.enabled ? [{ id: 'opencode', name: 'OpenCode', status: agent.opencodeWeb.status }] : []),
+      ...(agent?.desktopWeb?.enabled ? [{ id: 'desktop', name: '桌面', status: agent.desktopWeb.status }] : []),
+    ]),
   ];
   if (state.runtimeDeviceId !== agent?.agentId) {
     state.runtimeDeviceId = agent?.agentId;
     state.selectedApp = null;
+    el.localWebUrl.value = localStorage.getItem(`codex_local_web_url_${agent?.agentId}`) || '';
   }
   if (!apps.some((app) => app.id === state.selectedApp)) state.selectedApp = null;
   el.appCards.replaceChildren();
+  el.baseAppCards.replaceChildren();
+  el.deviceFoundation.classList.toggle('hidden', !apps.some(app => app.id === 'codex'));
+  el.deviceServicesTitle.classList.toggle('hidden', !apps.some(app => app.id !== 'codex'));
   for (const app of apps) {
     const ready = agent.online && agent.trusted && app.status === 'ready';
     const card = document.createElement(app.id === 'codex' || !ready ? 'button' : 'a');
@@ -243,7 +259,7 @@ function renderDeviceApps() {
       card.type = 'button'; card.disabled = !ready;
       card.onclick = () => selectDeviceApp('codex');
     } else {
-      card.href = `/${app.id}/${encodeURIComponent(agent.agentId)}/`;
+      card.href = app.href || `/${app.id}/${encodeURIComponent(agent.agentId)}/`;
       card.target = '_blank'; card.rel = 'noopener noreferrer';
     }
     const name = document.createElement('strong'); name.textContent = app.name;
@@ -251,11 +267,15 @@ function renderDeviceApps() {
     status.textContent = !agent.online ? '设备离线' : !agent.trusted ? '等待信任设备' :
       app.status === 'ready' ? '运行中' : app.status === 'error' ? '连接异常，正在重试' : '启动中…';
     const action = document.createElement('span'); action.className = 'app-action';
-    action.textContent = ready ? (app.id === 'codex' ? '进入会话 →' : '打开原生页面 ↗') : '暂不可用';
+    action.textContent = ready ? (app.id === 'codex' ? '进入会话 →' : app.id === 'desktop' ? '打开远程桌面 ↗' : '打开原生页面 ↗') : '暂不可用';
     card.appendChild(name); card.appendChild(status); card.appendChild(action);
-    el.appCards.appendChild(card);
+    (app.id === 'codex' ? el.baseAppCards : el.appCards).appendChild(card);
   }
   const launcher = state.selectedApp !== 'codex';
+  el.localWebForm.classList.toggle('hidden', !launcher || !agent?.localWeb?.enabled || Array.isArray(agent?.webServices));
+  el.localWebOpen.disabled = !agent?.online || !agent?.trusted;
+  el.localWebUrl.disabled = el.localWebOpen.disabled;
+  el.localWebError.textContent = !agent?.online ? '设备离线' : !agent?.trusted ? '请先信任设备' : '通过当前设备转发，需登录并信任设备。';
   el.deviceApps.classList.toggle('hidden', !launcher);
   el.btnDeviceApps.classList.toggle('hidden', launcher);
   for (const element of [el.chatContainer, el.codexComposer, el.codexActions, el.codexSearch,
@@ -264,12 +284,34 @@ function renderDeviceApps() {
   el.deviceAppsTitle.textContent = agent?.name || '等待设备连接';
   el.deviceAppsStatus.textContent = !agent ? '在电脑或服务器上运行 codex-up，即可在这里选择设备。' :
     !agent.online ? '设备离线。重新连接后，可继续打开它的应用。' :
-    !agent.trusted ? '请先信任并绑定这台设备。' : !apps.length ? '这台设备尚未启用应用。' : '选择这台设备上的应用';
+    !agent.trusted ? '请先信任并绑定这台设备。' : !apps.length && !agent.localWeb?.enabled ? '这台设备尚未启用应用。' : '选择这台设备上的应用';
   if (launcher) {
     el.currentThreadTitle.textContent = '设备应用';
     el.currentWorkspaceBadge.textContent = agent?.name || '未选择设备';
   }
 }
+
+function localWebDestination(value, agentId) {
+  let input = value.trim();
+  if (/^\d+$/.test(input)) input = `http://127.0.0.1:${input}/`;
+  else if (/^(?:127\.0\.0\.1|localhost)(?::|\/|$)/i.test(input)) input = 'http://' + input;
+  const url = new URL(input);
+  if (url.protocol !== 'http:' || !['127.0.0.1', 'localhost'].includes(url.hostname) || url.username || url.password) throw new Error('请输入本地 HTTP 网址或端口（1–65535）');
+  const port = Number(url.port || 80);
+  if (port < 1 || port > 65535) throw new Error('端口应为 1–65535');
+  return `/local/${encodeURIComponent(agentId)}/${port}${url.pathname}${url.search}${url.hash}`;
+}
+el.localWebForm.onsubmit = event => {
+  event.preventDefault();
+  const agent = getSelectedAgent();
+  if (!agent?.online || !agent?.trusted || !agent?.localWeb?.enabled) return;
+  try {
+    const url = localWebDestination(el.localWebUrl.value, agent.agentId);
+    localStorage.setItem(`codex_local_web_url_${agent.agentId}`, el.localWebUrl.value.trim());
+    window.open(url, '_blank', 'noopener,noreferrer');
+    el.localWebError.textContent = '已打开当前设备的本地网页。';
+  } catch (error) { el.localWebError.textContent = error.message || '请输入有效的本地 HTTP 网址或端口'; }
+};
 
 function selectDeviceApp(value) {
   const agent = getSelectedAgent();
@@ -340,7 +382,7 @@ function sendCodexRpc(method, params = {}, agentId = state.selectedAgentId) {
     const agent = state.agents.find((a) => a.agentId === agentId);
     if (!agent || !agent.online) return reject(new Error('当前未连接在线的本机 Agent'));
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-      return reject(new Error('云端 WebSocket 未连接'));
+      return reject(new Error('云端未连接'));
     }
     const id = `req_${++state.reqSeq}_${Date.now()}`;
     const payload = { id, method, params };
@@ -455,6 +497,7 @@ function connectRelayWebSocket() {
   ws.onopen = () => {
     if (state.ws !== ws) return;
     el.wsStatusDot.className = 'status-dot online';
+    el.wsStatusDot.title = ws.transport === 'poll' ? '已连接（HTTP 长轮询）' : '已连接（WebSocket）';
   };
 
   ws.onclose = () => {
@@ -1936,8 +1979,8 @@ function setupVisualViewportFix() {
 
 function resumeLoginDestination() {
   const destination = new URLSearchParams(location.search).get('next');
-  if (destination && /^\/(?:dsh|opencode)\/[a-zA-Z0-9_-]+\//.test(destination) && !/[\\\r\n]/.test(destination)) {
-    location.replace(destination);
+  if (destination && /^\/(?:dsh|opencode|desktop|local)\/[a-zA-Z0-9_-]+\//.test(destination) && !/[\\\r\n]/.test(destination)) {
+    location.replace(destination + (destination.includes('#') ? '' : location.hash || ''));
     return true;
   }
   return false;

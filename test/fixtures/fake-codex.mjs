@@ -6,6 +6,8 @@ import readline from 'node:readline';
 const log = (event) => fs.appendFileSync(path.join(process.cwd(), 'fake-codex.log'), `${process.pid} ${event}\n`);
 const emit = (payload) => process.stdout.write(`${JSON.stringify(payload)}\n`);
 const pending = new Map();
+const loadedThreads = new Set();
+let newThreadSequence = 0;
 log('start');
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const request = JSON.parse(line);
@@ -33,8 +35,31 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     reply({ data: [{ id: request.params?.cursor ? 'fixture-page-2' : threadId, cwd: process.cwd(), preview: 'Fixture thread' }],
       nextCursor: request.params?.cursor ? null : 'fixture-next-page' });
   }
+  else if (request.method === 'thread/start') {
+    const id = `new-${process.pid}-${++newThreadSequence}`;
+    loadedThreads.add(id);
+    reply({ thread: { id, cwd: request.params.cwd } });
+  }
+  else if (request.method === 'thread/loaded/list') {
+    const offset = Number(request.params?.cursor || 0);
+    const data = [...loadedThreads].slice(offset, offset + 1);
+    reply({ data, nextCursor: offset + 1 < loadedThreads.size ? String(offset + 1) : null });
+  }
   else if (request.method === 'thread/resume') {
-    if (threadId !== 'hang-resume') reply({ thread: { id: threadId } });
+    log(`resume ${threadId}`);
+    if (threadId.startsWith('new-') && !fs.existsSync(path.join(process.cwd(), `${threadId}.saved`))) {
+      emit({ id: request.id, error: { code: -32600, message: `no rollout found for thread id ${threadId}` } });
+    } else if (threadId === 'desktop-locked') {
+      emit({ id: request.id, error: { code: -32600, message: 'thread already has an active writer' } });
+    } else if (threadId !== 'hang-resume') {
+      loadedThreads.add(threadId);
+      reply({ thread: { id: threadId } });
+    }
+  }
+  else if (request.method === 'thread/fork') {
+    const id = `fork-${threadId}`;
+    loadedThreads.add(id);
+    reply({ thread: { id } });
   }
   else if (request.method === 'thread/turns/list') {
     log('history-start');
@@ -55,10 +80,15 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
     reply({ turnId: request.params.expectedTurnId });
     emit({ method: 'item/completed', params: { threadId, item: { id: 'steer-user', type: 'userMessage', content: request.params.input } } });
   } else if (request.method === 'turn/start') {
+    if (threadId.startsWith('new-') && !loadedThreads.has(threadId)) {
+      emit({ id: request.id, error: { code: -32600, message: 'thread is not loaded' } });
+      return;
+    }
     if (request.params?.input?.[0]?.text === 'fail') {
       log('turn-rejected');
       emit({ id: request.id, error: { code: -32000, message: 'fixture rejected turn' } });
     } else {
+      if (threadId.startsWith('new-')) fs.writeFileSync(path.join(process.cwd(), `${threadId}.saved`), 'persisted');
       emit({ method: 'turn/started', params: { threadId, turn: { id: 'turn', status: 'inProgress' } } });
       reply({ turn: { id: 'turn', status: 'inProgress' } });
       if (request.params?.input?.[0]?.text === 'ask') {

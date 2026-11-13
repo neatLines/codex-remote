@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 import http from 'node:http';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { acceptWebSocketUpgrade } from '../../src/ws-minimal.mjs';
 
 const args = process.argv.slice(2);
-const authorization = `Basic ${Buffer.from(`opencode:${process.env.OPENCODE_SERVER_PASSWORD}`).toString('base64')}`;
+const password = process.env.OPENCODE_PASSWORD || process.env.OPENCODE_SERVER_PASSWORD || crypto.randomBytes(32).toString('base64url');
+const authorization = `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`;
 const device = path.basename(process.cwd());
 const server = http.createServer((req, res) => {
   if (req.headers.authorization !== authorization) { res.writeHead(401); res.end(); return; }
@@ -30,4 +32,4 @@ server.on('upgrade', (req, socket, head) => {
   const ws = acceptWebSocketUpgrade(req, socket, head);
   ws.on('message', (data) => ws.send(device + ':' + data));
 });
-server.listen(Number(args[args.indexOf('--port') + 1]), '127.0.0.1');
+server.listen(Number(args[args.indexOf('--port') + 1]), '127.0.0.1', () => { if (!process.env.OPENCODE_PASSWORD && !process.env.OPENCODE_SERVER_PASSWORD) console.log(`server password ${password}`); });

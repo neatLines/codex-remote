@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import http from 'node:http';
 import os from 'node:os';
 import { Readable } from 'node:stream';
-import { gzip } from 'node:zlib';
+import { gzip, gunzipSync, brotliDecompressSync, inflateSync } from 'node:zlib';
 import { promisify } from 'node:util';
 import { cleanHeaders, decodeChunk, queueChunk, acknowledge, endStream } from './dsh-tunnel.mjs';
 
@@ -32,8 +32,10 @@ export function startManagedDsh({ bin = 'dsh', port = 3081, cwd = os.homedir(), 
   let retry;
   let ready;
   let status = { enabled: true, status: 'starting' };
+  let credentials;
   const publish = (next) => { status = { enabled: true, status: next }; onStatus(status); };
   function launch() {
+    credentials = undefined;
     publish('starting');
     let resolveReady, rejectReady;
     ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
@@ -70,6 +72,7 @@ export function startManagedDsh({ bin = 'dsh', port = 3081, cwd = os.homedir(), 
             exchangeCookie(base, token).then((cookie) => {
               if (child !== process || stopped || failed) return;
               clearTimeout(timer);
+              credentials = { token, cookie };
               publish('ready'); resolveReady({ base, cookie });
               if (!quiet) console.log(`[dsh-web] Ready on 127.0.0.1:${port}`);
             }).catch(() => {
@@ -100,6 +103,7 @@ export function startManagedDsh({ bin = 'dsh', port = 3081, cwd = os.homedir(), 
   launch();
   return {
     get status() { return status; },
+    get credentials() { return credentials; },
     async target() { return ready; },
     stop() {
       stopped = true; clearTimeout(retry);
@@ -110,7 +114,7 @@ export function startManagedDsh({ bin = 'dsh', port = 3081, cwd = os.homedir(), 
 }
 
 export function createDshAgentBridge({ getTarget, service = 'dsh', rewriteResponse }) {
-  if (!['dsh', 'opencode'].includes(service)) throw new Error('Unknown web service');
+  if (!['dsh', 'opencode', 'desktop', 'local'].includes(service)) throw new Error('Unknown web service');
   const tunnels = new Map();
   let send = () => false;
   function dispose(entry, notify = false) {
@@ -131,29 +135,35 @@ export function createDshAgentBridge({ getTarget, service = 'dsh', rewriteRespon
     });
   }
   async function open(message) {
-    const entry = { id: message.id, send, websocket: Boolean(message.websocket), ended: false };
+    const entry = { id: message.id, port: message.port, send, websocket: Boolean(message.websocket), ended: false };
     tunnels.set(entry.id, entry);
     try {
       if (typeof message.path !== 'string' || !message.path.startsWith('/') || /[\r\n]/.test(message.path)) throw new Error('Invalid DSH path');
-      const target = await getTarget();
+      const target = await getTarget(message);
+      const rewriter = target.rewriteResponse || rewriteResponse;
       if (!tunnels.has(entry.id)) return;
       const base = new URL(target.base);
-      // The only destination is this managed process's loopback listener, never browser input.
+      // Targets come only from the local service manager, never browser input.
       if (base.protocol !== 'http:' || base.hostname !== '127.0.0.1') throw new Error('Invalid DSH target');
-      const headers = cleanHeaders(message.headers, entry.websocket);
+      if (target.socketPath !== undefined && (typeof target.socketPath !== 'string' ||
+          !target.socketPath.startsWith('/') || target.socketPath.includes('\0'))) throw new Error('Invalid web socket path');
+      const localHeaders = service === 'local' ? { authorization: true, cookies: true } : undefined;
+      const headers = cleanHeaders(message.headers, entry.websocket, localHeaders);
       headers.host = base.host;
       headers.origin = base.origin;
       if (target.cookie) headers.cookie = target.cookie;
       if (target.authorization) headers.authorization = target.authorization;
-      if (rewriteResponse) headers['accept-encoding'] = 'identity';
+      if (rewriter) headers['accept-encoding'] = 'identity';
       if (entry.websocket) { headers.connection = 'Upgrade'; headers.upgrade = 'websocket'; }
       const request = http.request({ hostname: base.hostname, port: base.port, method: message.method,
-        path: message.path, headers, agent: false }, async (response) => {
+        socketPath: target.socketPath, path: message.path, headers, agent: false }, async (response) => {
         if (entry.websocket) { response.resume(); fail(entry); return; }
         if (!tunnels.has(entry.id)) { response.destroy(); return; }
         let source = response;
-        const responseHeaders = cleanHeaders(response.headers);
-        if (rewriteResponse?.matches(message.path, responseHeaders)) {
+        const responseHeaders = cleanHeaders(response.headers, false, localHeaders);
+        const rewrite = rewriter?.matches(message.path, responseHeaders);
+        const html = /text\/html/i.test(responseHeaders['content-type'] || '');
+        if (message.method !== 'HEAD' && (rewrite || html)) {
           try {
             const chunks = []; let length = 0;
             for await (const chunk of response) {
@@ -162,7 +172,23 @@ export function createDshAgentBridge({ getTarget, service = 'dsh', rewriteRespon
               chunks.push(chunk);
             }
             if (!tunnels.has(entry.id)) return;
-            let body = await rewriteResponse.transform(message.path, Buffer.concat(chunks), responseHeaders);
+            let body = Buffer.concat(chunks);
+            if (rewrite) body = await rewriter.transform(message.path, body, responseHeaders);
+            else {
+              const coding = responseHeaders['content-encoding'], options = { maxOutputLength: 16 * 1024 * 1024 };
+              if (coding === 'gzip') body = gunzipSync(body, options);
+              else if (coding === 'br') body = brotliDecompressSync(body, options);
+              else if (coding === 'deflate') body = inflateSync(body, options);
+              else if (coding && coding !== 'identity') throw new Error('Unsupported HTML encoding');
+            }
+            if (html) {
+              let text = body.toString('utf8');
+              if (!text.includes('src="/relay-transport.js"')) {
+                const script = '<script src="/relay-transport.js"></script>';
+                text = /<head\b[^>]*>/i.test(text) ? text.replace(/<head\b[^>]*>/i, '$&' + script) : script + text;
+              }
+              body = Buffer.from(text);
+            }
             delete responseHeaders['content-encoding']; delete responseHeaders.etag;
             if (/\bgzip\b(?!\s*;\s*q=0(?:\D|$))/i.test(message.headers?.['accept-encoding'] || '') && body.length > 1024) {
               body = await compressWebAsset(body);
@@ -191,7 +217,7 @@ export function createDshAgentBridge({ getTarget, service = 'dsh', rewriteRespon
         entry.socket = socket; entry.source = socket; entry.destination = socket;
         entry.onEndSent = () => dispose(entry);
         socket.pause();
-        entry.send({ type: 'dsh/headers', id: entry.id, status: 101, headers: cleanHeaders(response.headers, true) });
+        entry.send({ type: 'dsh/headers', id: entry.id, status: 101, headers: cleanHeaders(response.headers, true, localHeaders) });
         socket.on('data', (chunk) => { try { queueChunk(entry, chunk); } catch { fail(entry); } });
         socket.on('end', () => endStream(entry));
         socket.on('error', () => fail(entry));
@@ -225,6 +251,6 @@ export function createDshAgentBridge({ getTarget, service = 'dsh', rewriteRespon
       } catch { fail(entry); }
       return true;
     },
-    disconnect(notify = false) { for (const entry of tunnels.values()) dispose(entry, notify); },
+    disconnect(notify = false, port) { for (const entry of tunnels.values()) if (port === undefined || entry.port === port) dispose(entry, notify); },
   };
 }

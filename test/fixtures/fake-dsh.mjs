@@ -5,7 +5,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { acceptWebSocketUpgrade } from '../../src/ws-minimal.mjs';
 const args = process.argv.slice(2);
-const arg = (name) => args[args.indexOf(name) + 1];
+const arg = (name) => args.includes(name) ? args[args.indexOf(name) + 1] : undefined;
 const port = Number(arg('--port'));
 const token = crypto.randomBytes(20).toString('hex');
 const cookie = `dsh_browser=${crypto.randomBytes(20).toString('hex')}`;

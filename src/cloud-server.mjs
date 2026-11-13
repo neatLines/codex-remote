@@ -17,6 +17,8 @@ import {
 import { acceptWebSocketUpgrade } from './ws-minimal.mjs';
 import { createDshProxy } from './dsh-proxy.mjs';
 import { createFileStore } from './file-store.mjs';
+import { normalizeWebServices, publicWebServices } from './web-services.mjs';
+import { createHttpPollTransport } from './http-poll.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -208,6 +210,9 @@ export function createCloudServer(options = {}) {
         profile: info.profile || null,
         dshWeb: info.dshWeb || { enabled: false, status: 'disabled' },
         opencodeWeb: info.opencodeWeb || { enabled: false, status: 'disabled' },
+        desktopWeb: info.desktopWeb || { enabled: false, status: 'disabled' },
+        localWeb: info.localWeb || { enabled: false, status: 'disabled' },
+        webServices: publicWebServices(info.webServices),
         codexEnabled: info.codexEnabled !== false,
         codexStatus: info.codexStatus || 'ready',
         requiresE2E: Boolean(info.requiresE2E),
@@ -231,6 +236,9 @@ export function createCloudServer(options = {}) {
           codexStatus: 'offline',
           dshWeb: { enabled: saved.dshWeb?.enabled === true, status: 'offline' },
           opencodeWeb: { enabled: saved.opencodeWeb?.enabled === true, status: 'offline' },
+          desktopWeb: { enabled: saved.desktopWeb?.enabled === true, status: 'offline' },
+          localWeb: { enabled: saved.localWeb?.enabled === true, status: 'offline' },
+          webServices: saved.webServices?.map(service => ({ ...service, status: 'offline' })),
           requiresE2E: Boolean(saved.requiresE2E),
           e2eKeyFingerprint: saved.e2eKeyFingerprint || null,
           trusted: true,
@@ -266,6 +274,14 @@ export function createCloudServer(options = {}) {
     isTrusted: (agentId) => Boolean(authStore.state.trustedAgents[agentId]),
     publicOrigin: env.CODEX_PUBLIC_ORIGIN, service: 'opencode',
   });
+  const desktopProxy = createDshProxy({
+    agents, isAuthenticated: isRequestAuthenticated,
+    isTrusted: (agentId) => Boolean(authStore.state.trustedAgents[agentId]),
+    publicOrigin: env.CODEX_PUBLIC_ORIGIN, service: 'desktop',
+  });
+  const localProxy = createDshProxy({ agents, isAuthenticated: isRequestAuthenticated,
+    isTrusted: agentId => Boolean(authStore.state.trustedAgents[agentId]),
+    publicOrigin: env.CODEX_PUBLIC_ORIGIN, service: 'local' });
   const fileStore = createFileStore({ dataDir, env, authStore, isAuthenticated: isRequestAuthenticated,
     onChange: (file) => broadcastToClients({ type: 'relay/filesChanged', file }),
   });
@@ -286,10 +302,14 @@ export function createCloudServer(options = {}) {
     res.writeHead(308, { Location: `${redirectOrigin}${requestPath}`, 'Cache-Control': 'no-store' });
     res.end();
   }) : null;
+  const pollTransport = createHttpPollTransport({ server, isAuthenticated: isRequestAuthenticated,
+    readJsonBody, sendJson, publicOrigin: env.CODEX_PUBLIC_ORIGIN,
+    ...(options.pollTransportOptions || {}) });
 
   server.on('request', async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     const pathname = url.pathname;
+    if (await pollTransport.handleHttp(req, res)) return;
 
     // 1. Auth Status
     if (req.method === 'GET' && pathname === '/api/auth/status') {
@@ -366,6 +386,9 @@ export function createCloudServer(options = {}) {
     if (req.method === 'POST' && pathname === '/api/auth/logout') {
       dshProxy.closeSession(req.headers.cookie);
       opencodeProxy.closeSession(req.headers.cookie);
+      desktopProxy.closeSession(req.headers.cookie);
+      localProxy.closeSession(req.headers.cookie);
+      pollTransport.closeSession(req);
       sendJson(
         res,
         200,
@@ -422,6 +445,9 @@ export function createCloudServer(options = {}) {
           codexEnabled: live?.codexEnabled !== false,
           dshWeb: live?.dshWeb,
           opencodeWeb: live?.opencodeWeb,
+          desktopWeb: live?.desktopWeb,
+          localWeb: live?.localWeb,
+          webServices: publicWebServices(live?.webServices),
           requiresE2E: Boolean(live?.requiresE2E),
           e2eKeyFingerprint: live?.e2eKeyFingerprint || null,
           trustedAt: Date.now(),
@@ -436,6 +462,8 @@ export function createCloudServer(options = {}) {
         fileStore.revoke(agentId);
         dshProxy.revoke(agentId);
         opencodeProxy.revoke(agentId);
+        desktopProxy.revoke(agentId);
+        localProxy.revoke(agentId);
         if (live) {
           live.ws.send({ type: 'relay/trusted', trusted: false });
         }
@@ -453,6 +481,8 @@ export function createCloudServer(options = {}) {
     if (await fileStore.handleHttp(req, res)) return;
     if (dshProxy.handleHttp(req, res)) return;
     if (opencodeProxy.handleHttp(req, res)) return;
+    if (desktopProxy.handleHttp(req, res)) return;
+    if (localProxy.handleHttp(req, res)) return;
 
     // 6. Serve Static Assets
     let relPath = pathname === '/' ? '/index.html' : pathname;
@@ -482,6 +512,8 @@ export function createCloudServer(options = {}) {
 
     if (dshProxy.handleUpgrade(req, socket, head)) return;
     if (opencodeProxy.handleUpgrade(req, socket, head)) return;
+    if (desktopProxy.handleUpgrade(req, socket, head)) return;
+    if (localProxy.handleUpgrade(req, socket, head)) return;
 
     if (url.pathname === '/ws/client') {
       if (!isRequestAuthenticated(req)) {
@@ -603,6 +635,9 @@ export function createCloudServer(options = {}) {
           }
 
           registeredAgentId = agentId;
+          let webServices;
+          try { if (msg.webServices !== undefined) webServices = normalizeWebServices(msg.webServices); }
+          catch { ws.close(1008, 'Invalid service spec'); return; }
           const agentInfo = {
             agentId,
             ws,
@@ -621,6 +656,10 @@ export function createCloudServer(options = {}) {
               status: ['starting', 'ready', 'error'].includes(msg.dshWeb?.status) ? msg.dshWeb.status : 'disabled' },
             opencodeWeb: { enabled: msg.opencodeWeb?.enabled === true,
               status: ['starting', 'ready', 'error'].includes(msg.opencodeWeb?.status) ? msg.opencodeWeb.status : 'disabled' },
+            desktopWeb: { enabled: msg.desktopWeb?.enabled === true,
+              status: ['starting', 'ready', 'error'].includes(msg.desktopWeb?.status) ? msg.desktopWeb.status : 'disabled' },
+            localWeb: { enabled: msg.localWeb?.enabled === true, status: msg.localWeb?.enabled === true ? 'ready' : 'disabled' },
+            webServices,
           };
           agents.set(agentId, agentInfo);
 
@@ -636,6 +675,9 @@ export function createCloudServer(options = {}) {
               codexEnabled: agentInfo.codexEnabled,
               dshWeb: agentInfo.dshWeb,
               opencodeWeb: agentInfo.opencodeWeb,
+              desktopWeb: agentInfo.desktopWeb,
+              localWeb: agentInfo.localWeb,
+              webServices: publicWebServices(agentInfo.webServices),
               requiresE2E: agentInfo.requiresE2E,
               e2eKeyFingerprint: agentInfo.e2eKeyFingerprint,
               lastSeenAt: Date.now(),
@@ -659,10 +701,34 @@ export function createCloudServer(options = {}) {
         if (!registeredAgentId) return;
         if (dshProxy.handleMessage(registeredAgentId, ws, msg)) return;
         if (opencodeProxy.handleMessage(registeredAgentId, ws, msg)) return;
+        if (desktopProxy.handleMessage(registeredAgentId, ws, msg)) return;
+        if (localProxy.handleMessage(registeredAgentId, ws, msg)) return;
+        if (msg.type === 'agent/services') {
+          const agent = agents.get(registeredAgentId);
+          if (agent?.ws === ws) {
+            try { agent.webServices = normalizeWebServices(msg.webServices); }
+            catch { ws.close(1008, 'Invalid service spec'); return; }
+            agent.localWeb = { enabled: agent.webServices.length > 0, status: agent.webServices.length ? 'ready' : 'disabled' };
+            const saved = authStore.state.trustedAgents[registeredAgentId];
+            if (saved) { saved.webServices = publicWebServices(agent.webServices); saved.localWeb = agent.localWeb; authStore.save(); }
+            localProxy.servicesChanged(registeredAgentId);
+            broadcastAgentsUpdate();
+          }
+          return;
+        }
         if (msg.type === 'agent/codex_status') {
           const agent = agents.get(registeredAgentId);
           if (agent?.ws === ws && agent.codexStatus !== msg.status && ['starting', 'ready', 'error', 'disabled'].includes(msg.status)) {
             agent.codexStatus = msg.status;
+            broadcastAgentsUpdate();
+          }
+          return;
+        }
+        if (msg.type === 'agent/desktop_status') {
+          const agent = agents.get(registeredAgentId);
+          if (agent?.ws === ws) {
+            agent.desktopWeb = { enabled: msg.desktopWeb?.enabled === true,
+              status: ['starting', 'ready', 'error'].includes(msg.desktopWeb?.status) ? msg.desktopWeb.status : 'disabled' };
             broadcastAgentsUpdate();
           }
           return;
@@ -711,6 +777,8 @@ export function createCloudServer(options = {}) {
       ws.on('close', () => {
         dshProxy.disconnect(ws);
         opencodeProxy.disconnect(ws);
+        desktopProxy.disconnect(ws);
+        localProxy.disconnect(ws);
         if (registeredAgentId && agents.get(registeredAgentId)?.ws === ws) {
           agents.delete(registeredAgentId);
           if (authStore.state.trustedAgents[registeredAgentId]) {
@@ -745,6 +813,7 @@ export function createCloudServer(options = {}) {
     rateLimiter,
     agents,
     clients,
+    pollTransport,
     async listen() {
       const listenOn = (target, targetPort) => new Promise((resolve, reject) => {
         target.once('error', reject);
@@ -776,9 +845,12 @@ export function createCloudServer(options = {}) {
     },
     async close() {
       clearInterval(pingTimer);
+      pollTransport.close();
       fileStore.close();
       dshProxy.close();
       opencodeProxy.close();
+      desktopProxy.close();
+      localProxy.close();
       for (const c of clients) c.ws.close();
       for (const a of agents.values()) a.ws.close();
       await Promise.all([server, redirectServer].filter(Boolean).map((target) =>

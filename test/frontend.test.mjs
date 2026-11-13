@@ -80,6 +80,7 @@ function setup(options = {}) {
   const nodes = new Map();
   const timers = new Map();
   const sent = [];
+  const opened = [];
   const storage = new Map();
   const context = vm.createContext({
     document: { visibilityState: 'visible', getElementById(id) {
@@ -87,8 +88,8 @@ function setup(options = {}) {
       return nodes.get(id);
     }, createElement: (tag) => new Element(false, tag), createDocumentFragment: () => new Element(true), body: new Element() },
     localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
-    window: { innerWidth: 1000 }, WebSocket: { OPEN: 1 }, TextEncoder,
-    fetch: options.fetch,
+    window: { innerWidth: 1000, open: (...args) => opened.push(args) }, WebSocket: { OPEN: 1 }, TextEncoder, URL,
+    fetch: options.fetch, location: options.location, URLSearchParams,
     setTimeout: (fn) => { const id = {}; timers.set(id, fn); return id; },
     clearTimeout: (id) => timers.delete(id), console: { warn() {} },
     renderMarkdown: (node, text) => { node.textContent = text; node.markdownRenders = (node.markdownRenders || 0) + 1; },
@@ -98,7 +99,7 @@ function setup(options = {}) {
   const interactions = fs.readFileSync(new URL('../src/public/interactions.js', import.meta.url), 'utf8')
     .replace(/^import .*;$/gm, '').replace(/^export /gm, '');
   source = interactions + '\n' + source;
-  vm.runInContext(source + '\nglobalThis.app = { state, el, getThreadView, createThreadView, activateThreadView, openExistingThread, startNewThreadInWorkspace, sendUserPrompt, handleIncomingCodexPayload, rejectPendingRpc, syncThreadControls, applyAgentState, submitInteraction, loadThreadHistory, loadWorkspacesAndThreads, renderThreadItem, syncAgentState, renderWorkspacesDrawer, loadCloudFiles, refreshVisibleThread, scheduleHistoryRefresh, openDirectoryBrowser, renderDeviceApps, selectDeviceApp, handleAgentsList, document };', context);
+  vm.runInContext(source + '\nglobalThis.app = { state, el, getThreadView, createThreadView, activateThreadView, openExistingThread, startNewThreadInWorkspace, sendUserPrompt, handleIncomingCodexPayload, rejectPendingRpc, syncThreadControls, applyAgentState, submitInteraction, loadThreadHistory, loadWorkspacesAndThreads, renderThreadItem, syncAgentState, renderWorkspacesDrawer, loadCloudFiles, refreshVisibleThread, scheduleHistoryRefresh, openDirectoryBrowser, renderDeviceApps, selectDeviceApp, handleAgentsList, resumeLoginDestination, document };', context);
   const app = context.app;
   app.state.selectedAgentId = 'agent';
   app.state.selectedApp = 'codex';
@@ -111,19 +112,22 @@ function setup(options = {}) {
     app.handleIncomingCodexPayload({ id: request.payload.id, result, error }, request.agentId);
   };
   const notify = (method, params) => app.handleIncomingCodexPayload({ method, params }, 'agent');
-  return { ...app, sent, respond, notify, timers, storage };
+  return { ...app, sent, respond, notify, timers, storage, opened };
 }
 
 test('device launcher lists only enabled applications and links each native UI to its device', async () => {
   const app = setup();
   app.state.agents = [
-    { agentId: 'agent', name: '本地电脑', online: true, trusted: true, dshWeb: { enabled: true, status: 'ready' }, opencodeWeb: { enabled: true, status: 'ready' } },
+    { agentId: 'agent', name: '本地电脑', online: true, trusted: true, dshWeb: { enabled: true, status: 'ready' }, opencodeWeb: { enabled: true, status: 'ready' }, desktopWeb: { enabled: true, status: 'ready' } },
     { agentId: 'server', name: '测试服务器', online: true, trusted: true, codexEnabled: false, opencodeWeb: { enabled: true, status: 'ready' } },
   ];
   app.selectDeviceApp(null);
+  assert.equal(app.el.baseAppCards.children.length, 1);
   assert.equal(app.el.appCards.children.length, 3);
-  assert.equal(app.el.appCards.children[1].href, '/dsh/agent/');
-  assert.equal(app.el.appCards.children[2].href, '/opencode/agent/');
+  assert.equal(app.el.appCards.children[0].href, '/dsh/agent/');
+  assert.equal(app.el.appCards.children[1].href, '/opencode/agent/');
+  assert.equal(app.el.appCards.children[1].target, '_blank');
+  assert.equal(app.el.appCards.children[2].href, '/desktop/agent/');
   assert.equal(app.el.appCards.children[2].target, '_blank');
   assert.ok(app.el.chatContainer.classList.contains('hidden'));
   app.el.agentSelect.value = 'server'; app.el.agentSelect.onchange();
@@ -134,11 +138,55 @@ test('device launcher lists only enabled applications and links each native UI t
   assert.equal(app.sent.length, 0, 'OpenCode-only devices must not receive Codex RPCs');
 });
 
+test('local web launcher accepts any loopback port, preserves paths and hash, rejects remote hosts and follows device selection', () => {
+  const app = setup();
+  app.state.agents = [{ agentId: 'agent', name: '本地电脑', online: true, trusted: true, localWeb: { enabled: true } },
+    { agentId: 'other', name: '另一设备', online: true, trusted: true, localWeb: { enabled: true } }];
+  app.selectDeviceApp(null);
+  const submit = value => { app.el.localWebUrl.value = value; app.el.localWebForm.onsubmit({ preventDefault() {} }); };
+  submit('http://127.0.0.1:9090/ui/#/overview');
+  assert.equal(app.opened.at(-1)[0], '/local/agent/9090/ui/#/overview');
+  submit('3000'); assert.equal(app.opened.at(-1)[0], '/local/agent/3000/');
+  for (const invalid of ['http://evil.test:9090/', 'https://127.0.0.1:9090/', 'http://user:pass@localhost:9090/', '0', '65536']) {
+    const count = app.opened.length; submit(invalid); assert.equal(app.opened.length, count);
+  }
+  app.state.selectedAgentId = 'other'; app.renderDeviceApps();
+  assert.equal(app.el.localWebUrl.value, ''); submit('localhost:8080/test?q=1#hash');
+  assert.equal(app.opened.at(-1)[0], '/local/other/8080/test?q=1#hash');
+  app.state.agents[1].trusted = false; app.renderDeviceApps();
+  const count = app.opened.length; submit('9090'); assert.equal(app.opened.length, count); assert.equal(app.el.localWebOpen.disabled, true);
+});
+
+test('login resumes the local web destination with its hash route and rejects external destinations', () => {
+  const redirects = [];
+  const location = { search: '?next=' + encodeURIComponent('/local/agent/9090/ui/'), hash: '#/overview', replace: url => redirects.push(url) };
+  const app = setup({ location });
+  assert.equal(app.resumeLoginDestination(), true);
+  assert.equal(redirects[0], '/local/agent/9090/ui/#/overview');
+  location.search = '?next=' + encodeURIComponent('https://evil.test/local/agent/9090/');
+  assert.equal(app.resumeLoginDestination(), false); assert.equal(redirects.length, 1);
+});
+
+test('registered service cards follow each device spec while Codex stays in its own foundation section', () => {
+  const app = setup();
+  app.state.agents = [
+    { agentId: 'agent', online: true, trusted: true, webServices: [
+      {id:'dsh',name:'DSH',port:3081,path:'/',status:'ready'}, {id:'opencode',name:'OpenCode',port:3082,path:'/',status:'ready'}, {id:'panel',name:'9090 面板',port:9090,path:'/ui/#/overview',status:'ready'}] },
+    { agentId: 'server', online: true, trusted: true, codexEnabled: false, webServices: [{id:'opencode',name:'OpenCode',port:3082,path:'/',status:'ready'}] },
+  ];
+  app.selectDeviceApp(null);
+  assert.equal(app.el.baseAppCards.children.length,1); assert.equal(app.el.baseAppCards.children[0].dataset.app,'codex');
+  assert.equal(app.el.appCards.children.length,3); assert.equal(app.el.appCards.children[2].href,'/local/agent/9090/ui/#/overview');
+  assert.ok(app.el.localWebForm.classList.contains('hidden'));
+  app.state.selectedAgentId='server';app.renderDeviceApps();assert.equal(app.el.baseAppCards.children.length,0);assert.ok(app.el.deviceFoundation.classList.contains('hidden'));
+  assert.equal(app.el.appCards.children.length,1);assert.equal(app.el.appCards.children[0].href,'/local/server/3082/');
+});
+
 test('offline or untrusted devices stay selected with disabled applications', () => {
   const app = setup();
   app.state.selectedApp = null;
   app.handleAgentsList([
-    { agentId: 'agent', name: '离线电脑', online: false, trusted: true, opencodeWeb: { enabled: true, status: 'offline' } },
+    { agentId: 'agent', name: '离线电脑', online: false, trusted: true, opencodeWeb: { enabled: true, status: 'offline' }, desktopWeb: { enabled: true, status: 'offline' } },
     { agentId: 'server', name: '服务器', online: true, trusted: true, codexEnabled: false },
   ]);
   assert.equal(app.state.selectedAgentId, 'agent');

@@ -93,8 +93,14 @@ test('native route parser and dynamic CSS preloader stay inside the selected dev
   const parser = 'const parse=(path,search)=>{let parts=path.split(`/`).filter(Boolean);if(parts.length===0)return{type:`home`};if(parts[0]===`new-session`)return{type:`draft`};throw Error(`Unrecognised route!`)};return parse;';
   const parse = new Function(rewrite.transform('/_assets/runtime.js', Buffer.from(parser), headers).toString())();
   assert.deepEqual(parse('/opencode/server/', ''), { type: 'home' });
+  // Solid Router normalizes navigate('/') to its base without a trailing slash.
+  // This happens when returning home or closing the last native session tab.
+  assert.deepEqual(parse('/opencode/server', ''), { type: 'home' });
+  assert.deepEqual(parse('/', ''), { type: 'home' });
   assert.deepEqual(parse('/opencode/server/new-session', ''), { type: 'draft' });
+  assert.deepEqual(parse('/new-session', ''), { type: 'draft' });
   assert.throws(() => parse('/opencode/other/new-session', ''), /Unrecognised/);
+  assert.throws(() => parse('/opencode/server-other', ''), /Unrecognised/);
   const preload = 'return function(asset){return`/`+asset}';
   const url = new Function(rewrite.transform('/_assets/preload-helper-test.js', Buffer.from(preload), headers).toString())();
   assert.equal(url('_assets/dialog.css'), '/opencode/server/_assets/dialog.css');

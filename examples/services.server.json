@@ -1,0 +1,5 @@
+{
+  "services": [
+    { "id": "opencode", "name": "OpenCode", "kind": "opencode", "port": 3082 }
+  ]
+}

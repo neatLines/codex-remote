@@ -12,6 +12,7 @@ import { generateTotpCode } from '../src/crypto-auth.mjs';
 import { startLocalAgent } from '../src/local-agent.mjs';
 import { uploadAgentFile, uploadCredentialsPath } from '../src/file-upload.mjs';
 import { connectWebSocketClient, MinimalWebSocket } from '../src/ws-minimal.mjs';
+import { connectHttpPollClient } from '../src/relay-transport.mjs';
 
 function requestHttps(port, ca, requestPath, options = {}) {
   return new Promise((resolve, reject) => {
@@ -57,7 +58,7 @@ test('HTTPS, secure login cookies, verified WSS and the local agent work with a 
     },
   });
   let agent;
-  let client;
+  let client, pollClient;
   try {
     const port = await cloud.listen();
     const url = `wss://127.0.0.1:${port}`;
@@ -72,6 +73,13 @@ test('HTTPS, secure login cookies, verified WSS and the local agent work with a 
     assert.equal(login.status, 200);
     assert.match(login.headers['set-cookie'][0], /; Secure/);
     const cookie = login.headers['set-cookie'][0].split(';')[0];
+    await assert.rejects(connectHttpPollClient(`${url}/ws/client`, { headers: { Cookie: cookie } }));
+    pollClient = await connectHttpPollClient(`${url}/ws/client`, { ca, headers: { Cookie: cookie } });
+    const welcome = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('HTTPS poll welcome timed out')), 5000);
+      pollClient.on('message', raw => { const message = JSON.parse(raw); if (message.type === 'relay/welcome') { clearTimeout(timer); resolve(message); } });
+    });
+    assert.ok(welcome.clientId);
     const redirectPort = cloud.redirectServer.address().port;
     const redirect = await fetch(`http://127.0.0.1:${redirectPort}/some/path?test=1`, {
       redirect: 'manual', headers: { Host: 'attacker.example.test' },
@@ -121,7 +129,7 @@ test('HTTPS, secure login cookies, verified WSS and the local agent work with a 
       payload: { id: 'tls-workspaces', method: 'remote/getWorkspacesAndThreads', params: {} } });
     assert.ok(Array.isArray((await result).result.projects));
   } finally {
-    client?.close(); agent?.stop(); await cloud.close();
+    client?.close(); pollClient?.close(); agent?.stop(); await cloud.close();
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });

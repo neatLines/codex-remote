@@ -5,9 +5,9 @@ import os from 'node:os';
 // OpenCode 2's shipped SPA assumes an origin-root mount. Keep its own UI and
 // SDK, adapting only the router base, default server and static asset paths.
 // Every device gets a separate URL namespace; no mutable global device cookie.
-export function openCodeRewriter(agentId) {
+export function openCodeRewriter(agentId, { prefix = `/opencode/${agentId}` } = {}) {
   if (!/^[a-zA-Z0-9_-]+$/.test(agentId)) throw new Error('Invalid device ID');
-  const prefix = `/opencode/${agentId}`;
+  if (prefix !== `/opencode/${agentId}` && !new RegExp(`^/local/${agentId}/[1-9][0-9]{0,4}$`).test(prefix)) throw new Error('Invalid OpenCode mount');
   return {
     matches(requestPath, headers) {
       if (/^\/api(?:\/|\?|$)/.test(requestPath)) return false;
@@ -26,11 +26,12 @@ export function openCodeRewriter(agentId) {
         }
         // The native shell parses useLocation().pathname itself, which includes
         // Solid Router's base. Strip only this device's mount before parsing.
+        // Home navigation normalizes the base to a path without a trailing slash.
         if (text.includes('Unrecognised route!')) {
           const routePattern = /(\([\w$]+,[\w$]+\)=>\{let [\w$]+=)([\w$]+)(\.split\(`\/`\)\.filter\(Boolean\);if\([\w$]+\.length===0\)return\{type:`home`\})/g;
           if ([...text.matchAll(routePattern)].length !== 1) throw new Error('Unsupported OpenCode route parser');
           text = text.replace(routePattern, (_, start, pathname, end) =>
-            `${start}(${pathname}.startsWith(${JSON.stringify(prefix + '/')})?${pathname}.slice(${prefix.length}):${pathname})${end}`);
+            `${start}(${pathname}===${JSON.stringify(prefix)}?'/':${pathname}.startsWith(${JSON.stringify(prefix + '/')})?${pathname}.slice(${prefix.length}):${pathname})${end}`);
         }
         if (text.includes('currentServerUrl:')) {
           const serverPattern = /currentServerUrl:[\w$]+\(\)/g;
@@ -51,27 +52,39 @@ export function openCodeRewriter(agentId) {
 }
 
 export function startManagedOpenCode({ bin = 'opencode', port = 3082, cwd = os.homedir(),
-  onStatus = () => {}, onRestart = () => {}, quiet = false, startupTimeoutMs = 90000 } = {}) {
+  onStatus = () => {}, onRestart = () => {}, quiet = false, startupTimeoutMs = 90000, passwordRequired = true } = {}) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('OpenCode port must be between 1 and 65535');
   let stopped = false, child, retry, poll, ready;
+  let credentials;
   let status = { enabled: true, status: 'starting' };
   const publish = (value) => { status = { enabled: true, status: value }; onStatus(status); };
   const kill = (proc) => { try { process.kill(-proc.pid, 'SIGTERM'); } catch {} try { proc.kill('SIGTERM'); } catch {} };
   function launch() {
+    credentials = undefined;
     publish('starting');
-    const password = crypto.randomBytes(32).toString('base64url');
-    const authorization = `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`;
+    let password = passwordRequired ? crypto.randomBytes(32).toString('base64url') : process.env.OPENCODE_PASSWORD || process.env.OPENCODE_SERVER_PASSWORD;
+    let authorization = password ? `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}` : undefined;
     const base = `http://127.0.0.1:${port}`;
     let resolveReady, rejectReady;
     ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
     ready.catch(() => {});
+    const env = { ...process.env };
+    if (passwordRequired) { env.OPENCODE_PASSWORD = password; env.OPENCODE_SERVER_PASSWORD = password; env.OPENCODE_SERVER_USERNAME = 'opencode'; }
     const proc = spawn(bin, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
-      cwd, env: { ...process.env, OPENCODE_SERVER_PASSWORD: password, OPENCODE_SERVER_USERNAME: 'opencode' },
+      cwd, env,
       detached: true, stdio: ['ignore', 'pipe', 'pipe'],
     });
     child = proc;
     // OpenCode may print connection credentials; never forward child output.
-    proc.stdout.resume(); proc.stderr.resume();
+    let lineBuffer = '';
+    proc.stdout.on('data', chunk => {
+      lineBuffer += chunk.toString('utf8');
+      const lines = lineBuffer.split('\n'); lineBuffer = (lines.pop() || '').slice(-8192);
+      for (const line of lines) {
+        const match = /^server password ([^\r\n]+)\r?$/.exec(line);
+        if (!passwordRequired && match) { password = match[1].trim(); authorization = `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`; }
+      }
+    }); proc.stderr.resume();
     let failed = false;
     const fail = () => {
       if (failed) return;
@@ -87,11 +100,13 @@ export function startManagedOpenCode({ bin = 'opencode', port = 3082, cwd = os.h
     async function check() {
       if (stopped || failed || proc !== child) return;
       try {
-        const response = await fetch(`${base}/api/info`, { headers: { Authorization: authorization }, signal: AbortSignal.timeout(2000) });
+        if (!authorization) throw new Error('waiting for native OpenCode credentials');
+        const response = await fetch(`${base}/api/info`, { headers: authorization ? { Authorization: authorization } : {}, signal: AbortSignal.timeout(2000) });
         if (!response.ok) throw new Error('not ready');
         const info = await response.json();
         if (info.pid !== proc.pid || info.version !== '2.0.32') throw new Error('unexpected server version; expected OpenCode 2.0.32');
         if (stopped || failed || proc !== child) return;
+        credentials = { username: 'opencode', password, authorization };
         publish('ready'); resolveReady({ base, authorization });
         if (!quiet) console.log(`[opencode-web] Ready on 127.0.0.1:${port} (${info.version})`);
       } catch {
@@ -104,6 +119,7 @@ export function startManagedOpenCode({ bin = 'opencode', port = 3082, cwd = os.h
   launch();
   return {
     get status() { return status; },
+    get credentials() { return credentials; },
     async target() { return ready; },
     stop() { stopped = true; clearTimeout(retry); clearTimeout(poll); if (child) kill(child); },
   };

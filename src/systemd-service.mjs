@@ -11,6 +11,11 @@ const PROJECT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SERVICE_ENV_KEYS = ['PATH', 'CODEX_HOME', 'CODEX_BIN', 'CODEX_PROFILE', 'CODEX_AGENT_NAME',
   'CODEX_RELAY_URL', 'CODEX_RELAY_CA_FILE', 'CODEX_DSH_ENABLED', 'CODEX_DSH_BIN', 'CODEX_DSH_CWD', 'CODEX_DSH_PORT',
   'CODEX_CODEX_ENABLED', 'CODEX_OPENCODE_ENABLED', 'CODEX_OPENCODE_BIN', 'CODEX_OPENCODE_CWD', 'CODEX_OPENCODE_PORT',
+  'CODEX_DESKTOP_ENABLED', 'CODEX_WAYVNC_BIN', 'CODEX_WEBSOCKIFY_BIN', 'CODEX_NOVNC_DIR', 'CODEX_DESKTOP_OUTPUT', 'CODEX_DESKTOP_FPS',
+  'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR',
+  'CODEX_LOCAL_WEB_ENABLED',
+  'CODEX_RELAY_TRANSPORT',
+  'CODEX_WEB_SERVICES_FILE',
   'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
   'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS'];
 
@@ -64,13 +69,13 @@ function parseInstallArgs(args) {
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (arg === '--no-start') start = false;
-    else if (['--cwd', '--profile', '-p', '--relay', '--name'].includes(arg)) {
+    else if (['--cwd', '--profile', '-p', '--relay', '--name', '--services'].includes(arg)) {
       const value = args[++index];
       if (!value || value.startsWith('--')) throw new Error('服务安装参数缺少值');
       clean(value);
       if (arg === '--cwd') cwd = path.resolve(value);
       else agentArgs.push(arg, value);
-    } else if (['--no-dsh', '--dsh', '--no-e2e', '--no-codex', '--opencode', '--no-opencode'].includes(arg)) agentArgs.push(arg);
+    } else if (['--no-dsh', '--dsh', '--no-e2e', '--no-codex', '--opencode', '--no-opencode', '--desktop', '--no-desktop', '--local-web', '--no-local-web'].includes(arg)) agentArgs.push(arg);
     else throw new Error('不支持的服务安装参数');
   }
   if (!fs.statSync(cwd).isDirectory()) throw new Error('服务工作目录不存在');

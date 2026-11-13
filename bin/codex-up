@@ -31,7 +31,7 @@ CODEX_UP_IS_AGENT=1
 CODEX_UP_IS_SERVICE=0
 for CODEX_UP_ARG in "$@"; do
   case "${CODEX_UP_ARG}" in
-    --upload|--show-pairing-key|--help|-h) CODEX_UP_IS_AGENT=0 ;;
+    --upload|--show-pairing-key|--show-local-services|--help|-h) CODEX_UP_IS_AGENT=0 ;;
     --service-run) CODEX_UP_IS_SERVICE=1 ;;
   esac
 done

@@ -118,6 +118,50 @@ test('internal and forwarded RPC timeouts settle; a crashing child clears stale 
   } finally { await env.close(); }
 });
 
+test('fresh threads send without a rollout and persisted threads resume after process recycling', async () => {
+  const env = await fixture();
+  try {
+    const client = await env.connect();
+    const cwd = path.join(env.directory, 'new-project');
+    fs.mkdirSync(cwd);
+    // Put the target on the second page of loaded threads.
+    await client.rpc('thread/start', { cwd });
+    const created = await client.rpc('thread/start', { cwd });
+    assert.equal(created.result.thread.cwd, cwd);
+    const threadId = created.result.thread.id;
+    const before = (await client.rpc('remote/getAgentState')).result;
+    const first = await client.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'first message' }] });
+    assert.equal(first.error, undefined);
+    assert.equal(first.result.turn.id, 'turn');
+    const logPath = path.join(env.directory, 'fake-codex.log');
+    assert.equal(fs.readFileSync(logPath, 'utf8').includes(`resume ${threadId}`), false);
+    await eventually(async () => {
+      const state = (await client.rpc('remote/getAgentState')).result;
+      return state.status === 'ready' && state.epoch !== before.epoch;
+    });
+    const second = await client.rpc('turn/start', { threadId, input: [{ type: 'text', text: 'second message' }] });
+    assert.equal(second.error, undefined);
+    assert.equal(second.result.turn.id, 'turn');
+    assert.ok(fs.readFileSync(logPath, 'utf8').includes(`resume ${threadId}`));
+  } finally { await env.close(); }
+});
+
+test('unloaded writer-locked threads still fork and missing history is not silently replaced', async () => {
+  const env = await fixture();
+  try {
+    const client = await env.connect();
+    const missing = await client.rpc('turn/start', { threadId: 'new-missing', input: [{ type: 'text', text: 'message' }] });
+    assert.match(missing.error.message, /no rollout found/);
+    assert.equal(client.messages.some((m) => m.payload?.method === 'remote/threadForked'), false);
+    const locked = await client.rpc('turn/start', { threadId: 'desktop-locked', input: [{ type: 'text', text: 'message' }] });
+    assert.equal(locked.error, undefined);
+    const fork = client.messages.find((m) => m.payload?.method === 'remote/threadForked');
+    assert.deepEqual(fork.payload.params, { oldThreadId: 'desktop-locked', newThreadId: 'fork-desktop-locked' });
+    const started = client.messages.find((m) => m.payload?.method === 'turn/started');
+    assert.equal(started.payload.params.threadId, 'fork-desktop-locked');
+  } finally { await env.close(); }
+});
+
 test('a missing Codex executable produces a recoverable Agent state instead of an unhandled process error', async () => {
   const env = await fixture({ codexBin: '/definitely-missing/codex', restartDelayMs: 1000 });
   try {

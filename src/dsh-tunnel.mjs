@@ -4,11 +4,12 @@ export const MAX_BODY_BYTES = 256 * 1024 * 1024;
 const HOP_HEADERS = new Set(['connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade',
   'proxy-authorization', 'proxy-authenticate', 'cookie', 'set-cookie', 'authorization', 'host', 'origin']);
 
-export function cleanHeaders(headers, websocket = false) {
+export function cleanHeaders(headers, websocket = false, { authorization = false, cookies = false } = {}) {
   const clean = Object.create(null);
   for (const [name, value] of Object.entries(headers || {})) {
     const lower = name.toLowerCase();
-    if (HOP_HEADERS.has(lower) || lower.startsWith('x-forwarded-') || lower === 'forwarded') continue;
+    if ((HOP_HEADERS.has(lower) && !(authorization && lower === 'authorization') &&
+        !(cookies && ['cookie', 'set-cookie'].includes(lower))) || lower.startsWith('x-forwarded-') || lower === 'forwarded') continue;
     if (!websocket && lower.startsWith('sec-websocket-')) continue;
     if (lower === 'sec-fetch-site' || lower === 'sec-fetch-mode' || lower === 'sec-fetch-dest') continue;
     if (typeof value === 'string' || Array.isArray(value)) clean[lower] = value;

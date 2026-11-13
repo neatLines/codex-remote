@@ -116,6 +116,8 @@ sudo journalctl -u codex-remote-cloud -f
 
 ### 3. HTTPS / WSS 与私有 CA
 
+服务器同时运行网关和 OpenCode 时，可使用 [Docker Compose 部署说明](deploy/docker/README.md) 将两者分别容器化。设备身份、登录、工作目录和会话数据保存在镜像外；OpenCode 容器不挂载宿主机 Docker socket。
+
 云端可通过 `CODEX_TLS_CERT_FILE` 和 `CODEX_TLS_KEY_FILE` 直接启用 TLS，无需反向代理。将 `CODEX_CLOUD_PORT` 设为 `443`；配置 `CODEX_HTTP_REDIRECT_PORT=80` 和 `CODEX_PUBLIC_ORIGIN=https://remote.example.com` 后，HTTP 入口会跳转至 HTTPS。将示例域名替换为自己的服务地址。登录 Cookie 自动设置 `Secure`。
 
 本机 `.env` 使用以下配置连接私有 CA 签发的服务器证书：
@@ -129,7 +131,7 @@ CODEX_RELAY_CA_FILE=/absolute/path/to/your-ca.crt
 
 ### 4. 设备与原生应用
 
-服务器和本地电脑都注册为设备。登录后先选设备，页面展示该设备启用的应用及运行状态：Codex 进入 Remote 会话界面，DSH 和 OpenCode 在新标签页打开原生界面。设备离线时保留入口但禁止打开；切换设备回到应用列表。每个原生页面的 URL 固定包含设备 ID，可同时打开不同设备的会话。
+服务器和本地电脑都注册为设备。登录后先选设备，页面展示该设备启用的应用及运行状态：Codex 进入 Remote 会话界面，DSH、OpenCode 和桌面在新标签页打开原生界面。设备离线时保留入口但禁止打开；切换设备回到应用列表。每个原生页面的 URL 固定包含设备 ID，可同时打开不同设备的会话。
 
 OpenCode：先在设备上配置并验证 OpenCode 2.0.32 的模型供应商，然后运行：
 
@@ -151,6 +153,68 @@ OpenCode 仅监听 `127.0.0.1:3082`，使用每次启动随机生成的服务口
 
 DSH 入口为 `/dsh/<agentId>/`，需 Remote 登录、目标设备在线并受信任。撤销设备信任或退出登录会关闭已有代理连接。每次上传最多 256 MiB，传输使用分块确认控制内存占用。DSH 原生请求使用 Remote 会话鉴权；Codex RPC 的端到端 HMAC 签名不应用于 DSH 原生 API。
 
+#### 通用本地网页转发
+
+推荐通过注册 spec 声明每台设备的网页服务。参考 [本地电脑清单](examples/services.local.json) 和 [服务器清单](examples/services.server.json)。本地可以注册 DSH、OpenCode、9090 面板，服务器只注册 OpenCode；Codex 作为设备的基础能力单独显示，保留自己的会话、审批和签名通道。
+
+```bash
+codex-up --services /absolute/path/services.json
+# 或在现有服务环境中设置 CODEX_WEB_SERVICES_FILE，然后重启 Agent
+```
+
+spec 格式：
+
+```json
+{
+  "services": [
+    { "id": "dsh", "name": "DSH", "kind": "dsh", "port": 3081 },
+    { "id": "opencode", "name": "OpenCode", "kind": "opencode", "port": 3082 },
+    { "id": "panel", "name": "9090 面板", "port": 9090, "path": "/ui/#/overview" }
+  ]
+}
+```
+
+`kind` 默认 `http`，转发已在运行的本地端口；`dsh` / `opencode` 会由 Agent 拉起，并在退出后重启。注册 spec 后，网页只展示清单中的服务，代理也只允许清单中的端口。新增、移除普通端口，修改名称、路径或认证规则，保存文件后约 2 秒自动重新注册；改变托管应用的种类、端口或 id 需要重启 Agent。无效修改保留上一份有效配置。
+
+认证注入由通用代理统一处理，可为任意服务添加：
+
+```json
+"auth": {
+  "headers": { "Authorization": "Bearer YOUR_TOKEN", "Cookie": "session=YOUR_COOKIE" },
+  "query": { "token": "YOUR_TOKEN" }
+}
+```
+
+这些值在代理转发时覆盖浏览器同名值，同样适用于 WebSocket。认证信息只在设备注册连接与代理内部流转，不进入设备列表、网页配置或网关持久化的信任清单；含凭据的 spec 应设为仅当前用户可读。服务移除或认证更新会断开该服务的旧连接。
+
+spec 模式下 OpenCode 按常规方式只监听 `127.0.0.1`，使用原生生成的密码，Remote 读取原生启动输出并通过通用 Authorization 注入处理远程访问。DSH 保留原生首次 token 登录流程；启动 token 和换取的 Cookie 自动注册，代理通过通用 Cookie 注入处理远程访问。运行 `codex-up --show-local-services` 可在本机查看原生访问地址和登录信息（DSH 地址包含首次登录 token，OpenCode 显示原生用户名和密码，勿分享）；随后浏览器按原生流程直接访问。该命令读取权限 600 的 `CODEX_HOME/remote-native-services.json`，没有额外本机监听入口。
+
+下述不指定 spec 的按端口输入方式保留作为兼容模式。
+
+在设备上运行 `codex-up --local-web`，或设置 `CODEX_LOCAL_WEB_ENABLED=1` 后重启 Agent。Linux 用户服务可用 `codex-up service install --local-web --opencode` 保存启动参数。无需为每个端口单独配置：网页选择设备后，在 **本地网页** 输入端口或完整的本地 HTTP 网址，例如 `9090`、`http://127.0.0.1:9090/ui/#/overview`，即可在新标签页打开。输入内容按设备保存在当前浏览器中。
+
+转发地址为 `/local/<agentId>/<port>/<原路径>`，代理去掉设备和端口前缀后，将请求发送至目标设备的 `http://127.0.0.1:<port>`。支持 HTTP、上传下载、SSE 和 WebSocket；URL 查询参数及 hash 路由保留。`--no-local-web` 或 `CODEX_LOCAL_WEB_ENABLED=0` 可关闭。浏览器不能指定其他主机，端口范围为 1–65535；非 HTTP 服务不会因此变成网页。
+
+所有页面、资源、API 和 WebSocket 均检查 Remote 登录与设备信任，跨站请求会被拒绝，退出登录或撤销设备信任会断开已有连接。网关登录 Cookie 不传给本地服务；应用 Cookie 按设备和端口重命名及限定路径，应用自己的 Authorization 请求头保留。与 DSH/OpenCode 相同，通用转发使用网关会话鉴权，不应用 Codex RPC 的 HMAC 签名；启用后已登录用户可访问该设备任意本地 HTTP 端口，页面代码应来自自己信任的服务。
+
+代理调整 HTML 资源地址、CSS URL、ES module 的根路径导入及重定向，并在页面加载前注入路径兼容脚本，处理 fetch、XHR、WebSocket、EventSource 和常见导航；浏览器存储按设备和端口区分，Service Worker 不启用。已用 MetaCubeXD 1.245.1 的概览及实时连接验证。依赖特定根路径、严格 CSP/SRI、Worker 内网络请求或不可修改的浏览器地址假设的应用，可能仍需其自身的 base URL 配置。DSH/OpenCode 保留自动启动、服务认证及各自的页面兼容处理，底层复用同一套转发通道。
+
+#### 本地桌面（wayvnc + noVNC）
+
+可选共享当前登录的 Sway / wlroots Wayland 桌面，默认关闭。先安装 `wayvnc`、`novnc`、`websockify`（已验证 wayvnc 0.9.1、noVNC 1.6.0、websockify 0.13.0），然后在桌面会话中运行：
+
+```bash
+CODEX_DESKTOP_OUTPUT=eDP-1 codex-up --desktop --opencode
+# 或保存到现有用户服务：
+CODEX_DESKTOP_OUTPUT=eDP-1 codex-up service install --desktop --opencode
+```
+
+网页选择设备 → **桌面**，通过 `/desktop/<agentId>/` 打开 noVNC 并操作当前桌面。共享屏幕用 `CODEX_DESKTOP_OUTPUT` 指定，可通过 `swaymsg -t get_outputs` 查看名称；省略时由 wayvnc 选择。默认 12 帧、JPEG 质量 3、压缩级别 9，浏览器缩放画面，不改变物理屏幕分辨率。`CODEX_DESKTOP_FPS` 支持 1–30；noVNC 设置可调整画质。
+
+程序与资源路径可用 `CODEX_WAYVNC_BIN`、`CODEX_WEBSOCKIFY_BIN`、`CODEX_NOVNC_DIR` 覆盖。用户服务需继承正确的 `WAYLAND_DISPLAY` 和 `XDG_RUNTIME_DIR`；安装服务会保存这两个环境变量。桌面会话不可用时显示连接异常并自动重试，停止 Agent 时一并关闭桌面服务。`--no-desktop` 或 `CODEX_DESKTOP_ENABLED=0` 可关闭。
+
+VNC 和 WebSocket 服务仅使用权限 700 的临时目录内的 Unix socket，不监听 TCP 端口。页面、画面及输入通过既有 Agent 连接转发，沿用 Remote 登录与设备信任校验；退出登录或撤销信任会断开已有连接。和 DSH / OpenCode 一样，桌面代理不使用 Codex RPC 的 HMAC 签名，网关是受信任的中继。
+
 ### 5. Agent 上传文件与登录下载
 
 升级后先重新运行一次 `codex-up`，并确保该设备已在网页上受信任。Agent 会自动保存专用上传凭据到 `CODEX_HOME/remote-agent-upload.json`（仅当前用户可读），不需要提供网页登录口令。
@@ -170,6 +234,14 @@ DSH 入口为 `/dsh/<agentId>/`，需 Remote 登录、目标设备在线并受�
 接口：Agent 使用 `POST /api/files` 上传二进制，提供 `Authorization: Bearer <上传凭据>`、`X-Codex-Agent-Id`、URL 编码的 `X-File-Name` 和 `Content-Length`；网页登录会话访问 `GET /api/files` 及 `GET /api/files/<文件ID>/download`。上传凭据不会出现在文件列表、下载链接或 Git 中；私有 CA 配置同样用于上传连接。
 
 ## 验证
+
+公司网络无法建立 WebSocket 时，网页和 Agent 会自动降级到普通 HTTPS 长轮询。也可访问 `https://你的网关/?transport=poll` 强制使用长轮询；`?transport=auto` 恢复自动选择。该选择保存在当前浏览器标签页的会话存储中，新打开的原生网页会独立选择连接方式。连接状态圆点的提示会显示当前使用 WebSocket 还是 HTTP 长轮询。
+
+Agent 默认同样自动选择；需要强制 HTTP 时，在启动环境或用户服务 `service.env` 中设置 `CODEX_RELAY_TRANSPORT=poll` 后重启 Agent。私有 CA 仍通过原来的 `CODEX_RELAY_CA_FILE` 校验，HTTP 降级不会跳过证书验证。Node HTTP 客户端沿用现有直连方式，不增加代理环境变量解析。
+
+长轮询覆盖 Codex 的会话、回复、审批、设备状态，以及代理网页中的同源 WebSocket（文本及二进制）。DSH/OpenCode 的网页会在加载前注入兼容层；通用服务的子路径映射和认证注入继续使用原配置。SSE 和普通 HTTP 请求沿用原来的 HTTP 转发。页面自身的跨域连接、未注入兼容层的 Worker 内连接不在该降级范围内。
+
+备用通道使用 `/api/socket/` 下的 HTTPS 请求，最多等待 20 秒即返回一次，消息到达会立即响应。收取游标保留未确认事件；发送序号避免网络重试重复执行同一条消息。它复用原有 WebSocket 消息处理和设备信任逻辑，保留 Codex HMAC 签名校验；退出登录、撤销设备信任或移除服务会关闭相应连接。传输会话有独立随机令牌、队列上限和空闲过期，浏览器会话不能互相读取消息。
 
 运行 `npm test`（TLS 测试需要 `openssl`）。测试覆盖认证、签名、HTTPS/WSS、DSH、交互确认与多设备去重、断线重连、进程崩溃和请求超时，以及切换会话、后台回复、历史竞态、分页和追加指令。自动集成测试使用临时目录与模拟服务，不访问本机真实会话或调用模型。
 
