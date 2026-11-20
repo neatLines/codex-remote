@@ -1,12 +1,7 @@
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import os from 'node:os';
-import { Readable } from 'node:stream';
-import { gzip, gunzipSync, brotliDecompressSync, inflateSync } from 'node:zlib';
-import { promisify } from 'node:util';
-import { cleanHeaders, decodeChunk, queueChunk, acknowledge, endStream } from './dsh-tunnel.mjs';
 
-const compressWebAsset = promisify(gzip);
 const redact = (text) => String(text).replace(/([?&]token=)[^\s&]+/g, '$1[redacted]');
 
 function exchangeCookie(base, token) {
@@ -39,7 +34,6 @@ export function startManagedDsh({ bin = 'dsh', port = 3081, cwd = os.homedir(), 
     publish('starting');
     let resolveReady, rejectReady;
     ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
-    // Readiness can reject before anyone has opened the proxy page.
     ready.catch(() => {});
     const env = { ...globalThis.process.env };
     if (/^socks/i.test(env.ALL_PROXY || '') && /^https?:/i.test(env.https_proxy || env.HTTPS_PROXY || '')) {
@@ -79,7 +73,7 @@ export function startManagedDsh({ bin = 'dsh', port = 3081, cwd = os.homedir(), 
               rejectReady(new Error('DSH authentication failed')); publish('error');
               try { globalThis.process.kill(-child.pid, 'SIGTERM'); } catch {}
             });
-            continue; // Never print or forward the launch token.
+            continue;
           }
         }
         if (!quiet && globalThis.process.env.CODEX_DEBUG === '1') console.log(`[dsh-web] ${redact(line)}`);
@@ -110,147 +104,5 @@ export function startManagedDsh({ bin = 'dsh', port = 3081, cwd = os.homedir(), 
       if (process?.pid) { try { globalThis.process.kill(-process.pid, 'SIGTERM'); } catch {} }
       try { process?.kill('SIGTERM'); } catch {}
     },
-  };
-}
-
-export function createDshAgentBridge({ getTarget, service = 'dsh', rewriteResponse }) {
-  if (!['dsh', 'opencode', 'desktop', 'local'].includes(service)) throw new Error('Unknown web service');
-  const tunnels = new Map();
-  let send = () => false;
-  function dispose(entry, notify = false) {
-    if (!tunnels.delete(entry.id)) return;
-    entry.request?.destroy(); entry.socket?.destroy();
-    entry.source?.destroy();
-    if (notify) entry.send({ type: 'dsh/close', id: entry.id });
-  }
-  function fail(entry) {
-    if (!tunnels.has(entry.id)) return;
-    entry.send({ type: 'dsh/error', id: entry.id }); dispose(entry);
-  }
-  function write(entry, chunk) {
-    if (!entry.destination) { entry.pending = chunk; return; }
-    entry.destination.write(chunk, (error) => {
-      if (error) return fail(entry);
-      if (tunnels.has(entry.id)) entry.send({ type: 'dsh/ack', id: entry.id });
-    });
-  }
-  async function open(message) {
-    const entry = { id: message.id, port: message.port, send, websocket: Boolean(message.websocket), ended: false };
-    tunnels.set(entry.id, entry);
-    try {
-      if (typeof message.path !== 'string' || !message.path.startsWith('/') || /[\r\n]/.test(message.path)) throw new Error('Invalid DSH path');
-      const target = await getTarget(message);
-      const rewriter = target.rewriteResponse || rewriteResponse;
-      if (!tunnels.has(entry.id)) return;
-      const base = new URL(target.base);
-      // Targets come only from the local service manager, never browser input.
-      if (base.protocol !== 'http:' || base.hostname !== '127.0.0.1') throw new Error('Invalid DSH target');
-      if (target.socketPath !== undefined && (typeof target.socketPath !== 'string' ||
-          !target.socketPath.startsWith('/') || target.socketPath.includes('\0'))) throw new Error('Invalid web socket path');
-      const localHeaders = service === 'local' ? { authorization: true, cookies: true } : undefined;
-      const headers = cleanHeaders(message.headers, entry.websocket, localHeaders);
-      headers.host = base.host;
-      headers.origin = base.origin;
-      if (target.cookie) headers.cookie = target.cookie;
-      if (target.authorization) headers.authorization = target.authorization;
-      if (rewriter) headers['accept-encoding'] = 'identity';
-      if (entry.websocket) { headers.connection = 'Upgrade'; headers.upgrade = 'websocket'; }
-      const request = http.request({ hostname: base.hostname, port: base.port, method: message.method,
-        socketPath: target.socketPath, path: message.path, headers, agent: false }, async (response) => {
-        if (entry.websocket) { response.resume(); fail(entry); return; }
-        if (!tunnels.has(entry.id)) { response.destroy(); return; }
-        let source = response;
-        const responseHeaders = cleanHeaders(response.headers, false, localHeaders);
-        const rewrite = rewriter?.matches(message.path, responseHeaders);
-        const html = /text\/html/i.test(responseHeaders['content-type'] || '');
-        if (message.method !== 'HEAD' && (rewrite || html)) {
-          try {
-            const chunks = []; let length = 0;
-            for await (const chunk of response) {
-              length += chunk.length;
-              if (length > 16 * 1024 * 1024) throw new Error('Web asset too large');
-              chunks.push(chunk);
-            }
-            if (!tunnels.has(entry.id)) return;
-            let body = Buffer.concat(chunks);
-            if (rewrite) body = await rewriter.transform(message.path, body, responseHeaders);
-            else {
-              const coding = responseHeaders['content-encoding'], options = { maxOutputLength: 16 * 1024 * 1024 };
-              if (coding === 'gzip') body = gunzipSync(body, options);
-              else if (coding === 'br') body = brotliDecompressSync(body, options);
-              else if (coding === 'deflate') body = inflateSync(body, options);
-              else if (coding && coding !== 'identity') throw new Error('Unsupported HTML encoding');
-            }
-            if (html) {
-              let text = body.toString('utf8');
-              if (!text.includes('src="/relay-transport.js"')) {
-                const script = '<script src="/relay-transport.js"></script>';
-                text = /<head\b[^>]*>/i.test(text) ? text.replace(/<head\b[^>]*>/i, '$&' + script) : script + text;
-              }
-              body = Buffer.from(text);
-            }
-            delete responseHeaders['content-encoding']; delete responseHeaders.etag;
-            if (/\bgzip\b(?!\s*;\s*q=0(?:\D|$))/i.test(message.headers?.['accept-encoding'] || '') && body.length > 1024) {
-              body = await compressWebAsset(body);
-              responseHeaders['content-encoding'] = 'gzip';
-              responseHeaders.vary = 'Accept-Encoding';
-            }
-            if (!tunnels.has(entry.id)) return;
-            responseHeaders['content-length'] = String(body.length);
-            responseHeaders['cache-control'] = 'no-store';
-            source = Readable.from([body]);
-          } catch { fail(entry); return; }
-        }
-        entry.source = source;
-        entry.onEndSent = () => dispose(entry);
-        entry.send({ type: 'dsh/headers', id: entry.id, status: response.statusCode, headers: responseHeaders });
-        source.on('data', (chunk) => { try { queueChunk(entry, chunk); } catch { fail(entry); } });
-        source.on('end', () => endStream(entry));
-        source.on('error', () => fail(entry));
-        source.on('aborted', () => fail(entry));
-      });
-      entry.request = request;
-      entry.destination = request;
-      request.on('error', () => fail(entry));
-      request.on('upgrade', (response, socket, head) => {
-        if (!entry.websocket || !tunnels.has(entry.id)) { socket.destroy(); return; }
-        entry.socket = socket; entry.source = socket; entry.destination = socket;
-        entry.onEndSent = () => dispose(entry);
-        socket.pause();
-        entry.send({ type: 'dsh/headers', id: entry.id, status: 101, headers: cleanHeaders(response.headers, true, localHeaders) });
-        socket.on('data', (chunk) => { try { queueChunk(entry, chunk); } catch { fail(entry); } });
-        socket.on('end', () => endStream(entry));
-        socket.on('error', () => fail(entry));
-        socket.on('close', () => { if (!entry.endPending && !entry.outbound?.length) dispose(entry, true); });
-        if (head.length) queueChunk(entry, head); else socket.resume();
-      });
-      if (entry.pending) { const chunk = entry.pending; entry.pending = null; write(entry, chunk); }
-      if (entry.ended || entry.websocket) request.end();
-    } catch { fail(entry); }
-  }
-  return {
-    attach(sender) { this.disconnect(); send = (message) => sender({ ...message, type: message.type.replace(/^dsh\//, `${service}/`) }); },
-    handle(message) {
-      if (!message.type?.startsWith(`${service}/`)) return false;
-      message = { ...message, type: message.type.replace(`${service}/`, 'dsh/') };
-      if (message.type === 'dsh/open') {
-        if (typeof message.id !== 'string' || tunnels.has(message.id) || tunnels.size >= 128) return true;
-        open(message); return true;
-      }
-      const entry = tunnels.get(message.id);
-      if (!entry) return true;
-      try {
-        if (message.type === 'dsh/data') {
-          if (entry.pending) throw new Error('DSH flow-control violation');
-          write(entry, decodeChunk(message.data));
-        } else if (message.type === 'dsh/ack') acknowledge(entry);
-        else if (message.type === 'dsh/end') {
-          entry.ended = true;
-          if (entry.websocket) entry.socket?.end(); else entry.request?.end();
-        } else if (message.type === 'dsh/close') dispose(entry);
-      } catch { fail(entry); }
-      return true;
-    },
-    disconnect(notify = false, port) { for (const entry of tunnels.values()) if (port === undefined || entry.port === port) dispose(entry, notify); },
   };
 }

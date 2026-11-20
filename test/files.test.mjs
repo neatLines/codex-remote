@@ -38,8 +38,7 @@ async function fixture(limits = {}) {
     cookie = response.headers.get('set-cookie').split(';')[0]; await response.arrayBuffer();
   }
   await listen();
-  agent = startLocalAgent({ relayUrl, codexHome, quiet: true, dshEnabled: false, defaultCwd: dir,
-    codexBin: fileURLToPath(new URL('./fixtures/fake-codex.mjs', import.meta.url)) });
+  agent = startLocalAgent({ relayUrl, codexHome, quiet: true, defaultCwd: dir });
   await until(() => cloud.agents.has(agent.identity.agentId));
   const agentId = agent.identity.agentId;
   async function trust(trusted) {

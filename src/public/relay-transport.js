@@ -18,7 +18,7 @@
         const url = new URL(value, where.href);
         if (url.protocol === 'https:') url.protocol = 'wss:'; if (url.protocol === 'http:') url.protocol = 'ws:';
         if (!['ws:', 'wss:'].includes(url.protocol) || url.hash) throw new SyntaxError('Invalid WebSocket URL');
-        const gatewaySocket = url.host === where.host && (['/ws/client', '/ws/agent'].includes(url.pathname) || /^\/(?:dsh|opencode|desktop|local)\/[a-zA-Z0-9_-]+\//.test(url.pathname));
+        const gatewaySocket = url.host === where.host && (['/ws/client', '/ws/agent'].includes(url.pathname) || /^\/local\/[a-zA-Z0-9_-]+\/[1-9][0-9]{0,4}\//.test(url.pathname));
         // Leave unrelated sockets as native objects, including browser tooling
         // and applications that depend on the browser's WebSocket internal slots.
         if (!gatewaySocket && NativeWebSocket) return new NativeWebSocket(url.href, protocols);

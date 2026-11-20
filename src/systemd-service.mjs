@@ -8,11 +8,11 @@ import { fileURLToPath } from 'node:url';
 export const SERVICE_NAME = 'codex-up.service';
 const MARKER = '# Managed by codex-up; reinstall with codex-up service install.';
 const PROJECT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const SERVICE_ENV_KEYS = ['PATH', 'CODEX_HOME', 'CODEX_BIN', 'CODEX_PROFILE', 'CODEX_AGENT_NAME',
-  'CODEX_RELAY_URL', 'CODEX_RELAY_CA_FILE', 'CODEX_DSH_ENABLED', 'CODEX_DSH_BIN', 'CODEX_DSH_CWD', 'CODEX_DSH_PORT',
-  'CODEX_CODEX_ENABLED', 'CODEX_OPENCODE_ENABLED', 'CODEX_OPENCODE_BIN', 'CODEX_OPENCODE_CWD', 'CODEX_OPENCODE_PORT',
-  'CODEX_DESKTOP_ENABLED', 'CODEX_WAYVNC_BIN', 'CODEX_WEBSOCKIFY_BIN', 'CODEX_NOVNC_DIR', 'CODEX_DESKTOP_OUTPUT', 'CODEX_DESKTOP_FPS',
-  'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR',
+const SERVICE_ENV_KEYS = ['PATH', 'CODEX_HOME', 'CODEX_AGENT_NAME',
+  'CODEX_RELAY_URL', 'CODEX_RELAY_CA_FILE',
+  'CODEX_DSH_BIN', 'CODEX_DSH_CWD',
+  'CODEX_OPENCODE_BIN', 'CODEX_OPENCODE_CWD',
+  'CODEX_T3_CODE_BIN', 'T3CODE_HOME',
   'CODEX_LOCAL_WEB_ENABLED',
   'CODEX_RELAY_TRANSPORT',
   'CODEX_WEB_SERVICES_FILE',
@@ -69,13 +69,13 @@ function parseInstallArgs(args) {
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (arg === '--no-start') start = false;
-    else if (['--cwd', '--profile', '-p', '--relay', '--name', '--services'].includes(arg)) {
+    else if (['--cwd', '--relay', '--name', '--services'].includes(arg)) {
       const value = args[++index];
       if (!value || value.startsWith('--')) throw new Error('服务安装参数缺少值');
       clean(value);
       if (arg === '--cwd') cwd = path.resolve(value);
       else agentArgs.push(arg, value);
-    } else if (['--no-dsh', '--dsh', '--no-e2e', '--no-codex', '--opencode', '--no-opencode', '--desktop', '--no-desktop', '--local-web', '--no-local-web'].includes(arg)) agentArgs.push(arg);
+    } else if (['--local-web', '--no-local-web'].includes(arg)) agentArgs.push(arg);
     else throw new Error('不支持的服务安装参数');
   }
   if (!fs.statSync(cwd).isDirectory()) throw new Error('服务工作目录不存在');
@@ -85,7 +85,7 @@ function parseInstallArgs(args) {
 export function manageService(args = process.argv.slice(2)) {
   const [action, ...options] = args;
   if (!action || action === '--help' || action === 'help') {
-    console.log('用法：codex-up service install [--cwd 目录] [--profile 名称] [--no-start]\n' +
+    console.log('用法：codex-up service install [--cwd 目录] [--services 清单路径] [--no-start]\n' +
       '      codex-up service start|stop|restart|status|logs|uninstall\n' +
       '对应 systemctl --user 管理的 codex-up.service；install 默认启用开机自启并启动服务。');
     return 0;

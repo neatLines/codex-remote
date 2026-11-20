@@ -13,13 +13,13 @@ export function otherAgentPids(codexHome = process.env.CODEX_HOME || path.join(o
       const root = `/proc/${entry}`;
       if (fs.statSync(root).uid !== process.getuid()) continue;
       const args = fs.readFileSync(`${root}/cmdline`, 'utf8').split('\0');
-      if (args.includes('--upload') || args.includes('--show-pairing-key')) continue;
+      if (args.includes('--upload')) continue;
       const script = args.find((arg) => /(?:^|\/)src\/local-agent\.mjs$/.test(arg));
       if (!script) continue;
       const cwd = fs.readlinkSync(`${root}/cwd`);
       const source = path.resolve(cwd, script);
       const packageFile = path.join(path.dirname(source), '..', 'package.json');
-      if (JSON.parse(fs.readFileSync(packageFile, 'utf8')).name !== 'codex-remote') continue;
+      if (!['remote-hub', 'codex-remote'].includes(JSON.parse(fs.readFileSync(packageFile, 'utf8')).name)) continue;
       const raw = fs.readFileSync(`${root}/environ`, 'utf8').split('\0');
       const value = (name) => raw.find((part) => part.startsWith(name + '='))?.slice(name.length + 1);
       const home = value('CODEX_HOME') || path.join(value('HOME') || os.homedir(), '.codex');

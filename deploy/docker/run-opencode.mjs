@@ -2,7 +2,9 @@ import http from 'node:http';
 import { startLocalAgent } from '../../src/local-agent.mjs';
 
 process.umask(0o077);
-const agent = startLocalAgent({ codexEnabled: false, dshEnabled: false, opencodeEnabled: true });
+const agent = startLocalAgent({
+  webServicesFile: process.env.CODEX_WEB_SERVICES_FILE,
+});
 const health = http.createServer((req, res) => {
   if (req.url !== '/health') { res.writeHead(404).end(); return; }
   const status = { connected: agent.connected, opencode: agent.opencodeStatus.status };

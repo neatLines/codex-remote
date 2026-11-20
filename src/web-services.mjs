@@ -7,10 +7,10 @@ export function normalizeWebServices(value, { credentials = true } = {}) {
   return value.map(entry => {
     if (!entry || !ID.test(entry.id) || entry.id === 'codex' || typeof entry.name !== 'string' || !entry.name.trim() || entry.name.length > 100) throw new Error('网页服务需要有效的 id 和 name（codex 为基础能力保留）');
     const kind = entry.kind || 'http', port = entry.port;
-    if (!['http', 'dsh', 'opencode'].includes(kind) || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('网页服务 kind 或 port 无效');
+    if (!['http', 'dsh', 'opencode', 't3-code'].includes(kind) || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('网页服务 kind 或 port 无效');
     if (ids.has(entry.id) || ports.has(port) || (kind !== 'http' && managed.has(kind))) throw new Error('网页服务 id、端口或托管应用重复');
     ids.add(entry.id); ports.add(port); if (kind !== 'http') managed.add(kind);
-    const pathname = entry.path || '/';
+    const pathname = entry.path || (kind === 't3-code' ? '/?transport=websocket' : '/');
     if (typeof pathname !== 'string' || !pathname.startsWith('/') || pathname.startsWith('//') || /[\\\x00-\x20\x7f]/.test(pathname)) throw new Error('网页服务 path 必须为本地绝对路径');
     const result = { id: entry.id, name: entry.name.trim(), kind, port, path: pathname,
       status: ['starting', 'ready', 'error', 'offline'].includes(entry.status) ? entry.status : 'ready' };

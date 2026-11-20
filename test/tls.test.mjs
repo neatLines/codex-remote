@@ -6,7 +6,6 @@ import https from 'node:https';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
 import { createCloudServer } from '../src/cloud-server.mjs';
 import { generateTotpCode } from '../src/crypto-auth.mjs';
 import { startLocalAgent } from '../src/local-agent.mjs';
@@ -86,9 +85,12 @@ test('HTTPS, secure login cookies, verified WSS and the local agent work with a 
     });
     assert.equal(redirect.status, 308);
     assert.equal(redirect.headers.get('location'), 'https://fixed.example.test/some/path?test=1');
-    agent = startLocalAgent({ relayUrl: `${url}/ws/agent`, relayCaFile: cert,
-      codexHome: path.join(directory, 'agent'), defaultCwd: directory,
-      codexBin: fileURLToPath(new URL('./fixtures/fake-codex.mjs', import.meta.url)), quiet: true,
+    agent = startLocalAgent({
+      relayUrl: `${url}/ws/agent`,
+      relayCaFile: cert,
+      codexHome: path.join(directory, 'agent'),
+      defaultCwd: directory,
+      quiet: true,
     });
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => { clearInterval(poll); reject(new Error('TLS agent did not register')); }, 5000);
@@ -116,18 +118,17 @@ test('HTTPS, secure login cookies, verified WSS and the local agent work with a 
     assert.equal(downloaded.status, 200);
     assert.equal(downloaded.body, 'verified TLS file upload');
     client = await connectWebSocketClient(`${url}/ws/client`, { ca, headers: { Cookie: cookie } });
-    const result = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('WSS RPC did not complete')), 5000);
+    const pong = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('WSS ping did not complete')), 5000);
       client.on('message', (raw) => {
         const message = JSON.parse(raw);
-        if (message.type === 'relay/rpc' && message.payload?.id === 'tls-workspaces') {
-          clearTimeout(timer); resolve(message.payload);
+        if (message.type === 'relay/pong') {
+          clearTimeout(timer); resolve(message);
         }
       });
     });
-    client.send({ type: 'client/rpc', agentId: agent.identity.agentId,
-      payload: { id: 'tls-workspaces', method: 'remote/getWorkspacesAndThreads', params: {} } });
-    assert.ok(Array.isArray((await result).result.projects));
+    client.send({ type: 'client/ping' });
+    assert.ok((await pong).ts);
   } finally {
     client?.close(); pollClient?.close(); agent?.stop(); await cloud.close();
     fs.rmSync(directory, { recursive: true, force: true });

@@ -3,7 +3,7 @@ import { Duplex, PassThrough } from 'node:stream';
 import { MinimalWebSocket } from './ws-minimal.mjs';
 
 const session = req => String(req.headers.cookie || '').split(';').map(v => v.trim()).find(v => v.startsWith('codex_remote_session='));
-const allowedPath = pathname => pathname === '/ws/client' || pathname === '/ws/agent' || /^\/(?:dsh|opencode|desktop)\/[a-zA-Z0-9_-]+\//.test(pathname) || /^\/local\/[a-zA-Z0-9_-]+\/[1-9][0-9]{0,4}\//.test(pathname);
+const allowedPath = pathname => pathname === '/ws/client' || pathname === '/ws/agent' || /^\/local\/[a-zA-Z0-9_-]+\/[1-9][0-9]{0,4}\//.test(pathname);
 
 // Enter the existing upgrade handlers over an in-memory socket pair. There is
 // no second TCP connection, certificate exception, or parallel authorization path.

@@ -2,7 +2,8 @@
 export const CHUNK_BYTES = 64 * 1024;
 export const MAX_BODY_BYTES = 256 * 1024 * 1024;
 const HOP_HEADERS = new Set(['connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade',
-  'proxy-authorization', 'proxy-authenticate', 'cookie', 'set-cookie', 'authorization', 'host', 'origin']);
+  'proxy-authorization', 'proxy-authenticate', 'cookie', 'set-cookie', 'authorization', 'host', 'origin',
+  'x-frame-options', 'content-security-policy', 'content-security-policy-report-only']);
 
 export function cleanHeaders(headers, websocket = false, { authorization = false, cookies = false } = {}) {
   const clean = Object.create(null);

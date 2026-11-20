@@ -1,43 +1,20 @@
-import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { E2EVerifier } from './crypto-auth.mjs';
-import { AgentInteractions } from './agent-interactions.mjs';
 import { connectRelayTransport } from './relay-transport.mjs';
-import { startManagedDsh, createDshAgentBridge } from './dsh-web.mjs';
+import { startManagedDsh } from './dsh-web.mjs';
 import { clearUploadCredentials, registrationUploadToken, saveUploadCredentials, uploadAgentFile } from './file-upload.mjs';
 import { waitForPreviousAgent } from './agent-process.mjs';
 import { startManagedOpenCode, openCodeRewriter } from './opencode-web.mjs';
-import { startManagedDesktop } from './desktop-web.mjs';
-import { localWebRewriter } from './local-web.mjs';
+import { startManagedT3Code } from './t3-code-web.mjs';
+import { createLocalAgentBridge, localWebRewriter } from './local-web.mjs';
 import { readWebServices, normalizeWebServices } from './web-services.mjs';
 
-const READ_ONLY_METHODS = new Set([
-  'remote/getWorkspacesAndThreads',
-  'remote/ping',
-  'remote/getAgentState',
-  'thread/list',
-  'thread/loaded/list',
-  'thread/read',
-  'thread/resume',
-  'thread/turns/list',
-  'thread/items/list',
-  'project/list',
-  'project/read',
-  'model/list',
-  'fs/readDirectory',
-  'fs/getMetadata',
-  'fs/readFile',
-  'config/read',
-  'skills/list',
-]);
-
 /**
- * Load or create persistent local agent identity and E2E signing key.
+ * Load or create persistent local agent identity.
  * @param {string} codexHome
  */
 export function loadOrCreateAgentIdentity(codexHome = path.join(os.homedir(), '.codex')) {
@@ -58,871 +35,223 @@ export function loadOrCreateAgentIdentity(codexHome = path.join(os.homedir(), '.
     dirty = true;
   }
 
-  if (!data.localSigningKey) {
-    const raw = crypto.randomBytes(9).toString('base64url').toUpperCase().replace(/[^A-Z0-9]/g, 'X');
-    data.localSigningKey = `${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}`;
-    dirty = true;
-  }
-
   if (dirty) {
     fs.writeFileSync(idFile, JSON.stringify(data, null, 2), { mode: 0o600 });
   }
 
-  const e2eKeyFingerprint = crypto
-    .createHash('sha256')
-    .update(String(data.localSigningKey))
-    .digest('hex')
-    .slice(0, 10);
-
   return {
     idFile,
     agentId: data.agentId,
-    localSigningKey: data.localSigningKey,
-    e2eKeyFingerprint,
   };
 }
 
 /**
- * Read desktop workspaces and thread-project mappings from ~/.codex/.codex-global-state.json.
- * @param {string} codexHome
- */
-export function readDesktopGlobalWorkspaces(codexHome = path.join(os.homedir(), '.codex')) {
-  const globalStateFile = path.join(codexHome, '.codex-global-state.json');
-  if (!fs.existsSync(globalStateFile)) {
-    return { projects: [], threadProjectAssignments: {}, sidebarOrders: {} };
-  }
-
-  try {
-    const raw = JSON.parse(fs.readFileSync(globalStateFile, 'utf8'));
-    const localProjects = raw['local-projects'] || {};
-    const projectOrder = Array.isArray(raw['project-order'])
-      ? raw['project-order']
-      : Object.keys(localProjects);
-    const threadProjectAssignments = raw['thread-project-assignments'] || {};
-    const sidebarOrders = raw['sidebar-project-thread-orders'] || {};
-
-    const seen = new Set();
-    const projects = [];
-    for (const pid of [...projectOrder, ...Object.keys(localProjects)]) {
-      if (seen.has(pid) || !localProjects[pid]) continue;
-      seen.add(pid);
-      const p = localProjects[pid];
-      projects.push({
-        id: p.id || pid,
-        name: p.name || path.basename((p.rootPaths && p.rootPaths[0]) || pid),
-        rootPaths: Array.isArray(p.rootPaths) ? p.rootPaths : [],
-        updatedAt: p.updatedAt || p.createdAt || 0,
-      });
-    }
-
-    return { projects, threadProjectAssignments, sidebarOrders };
-  } catch {
-    return { projects: [], threadProjectAssignments: {}, sidebarOrders: {} };
-  }
-}
-
-/**
- * Start the local Codex App-Server bridge and connect to the Cloud Relay.
+ * Start the local Agent bridge and connect to the Cloud Relay.
  * @param {{
  *   relayUrl?: string,
  *   relayCaFile?: string,
  *   relayTransport?: 'auto' | 'poll' | 'websocket',
- *   dshEnabled?: boolean,
- *   dshBin?: string,
- *   dshPort?: number,
- *   dshCwd?: string,
- *   codexEnabled?: boolean,
- *   opencodeEnabled?: boolean,
- *   opencodeBin?: string,
- *   opencodePort?: number,
- *   opencodeCwd?: string,
- *   desktopEnabled?: boolean,
  *   localWebEnabled?: boolean,
  *   webServices?: Array<object>,
  *   webServicesFile?: string,
- *   wayvncBin?: string,
- *   websockifyBin?: string,
- *   novncDir?: string,
- *   desktopOutput?: string,
- *   desktopFps?: number,
- *   codexBin?: string,
+ *   t3CodeBin?: string,
+ *   dshBin?: string,
+ *   dshCwd?: string,
+ *   opencodeBin?: string,
+ *   opencodeCwd?: string,
  *   codexHome?: string,
- *   profile?: string | null,
  *   agentName?: string,
  *   defaultCwd?: string,
- *   requiresE2E?: boolean,
- *   quiet?: boolean,
- *   requestTimeoutMs?: number,
- *   restartDelayMs?: number
+ *   quiet?: boolean
  * }} [options]
  */
 export function startLocalAgent(options = {}) {
-  const codexEnabled = options.codexEnabled ?? (process.env.CODEX_CODEX_ENABLED !== '0');
-  const servicesFile = options.webServicesFile || process.env.CODEX_WEB_SERVICES_FILE;
-  let services = options.webServices !== undefined ? normalizeWebServices(options.webServices) : servicesFile ? readWebServices(servicesFile) : undefined;
+  const servicesFile = options.webServicesFile ?? (!options.codexHome ? process.env.CODEX_WEB_SERVICES_FILE : undefined);
+  let services = options.webServices !== undefined
+    ? normalizeWebServices(options.webServices)
+    : servicesFile ? readWebServices(servicesFile) : undefined;
   const serviceOf = kind => services?.find(service => service.kind === kind);
-  const opencodeEnabled = services ? Boolean(serviceOf('opencode')) : options.opencodeEnabled ?? (process.env.CODEX_OPENCODE_ENABLED === '1');
-  const desktopEnabled = options.desktopEnabled ?? (process.env.CODEX_DESKTOP_ENABLED === '1');
-  const localWebEnabled = services ? services.length > 0 : options.localWebEnabled ?? (process.env.CODEX_LOCAL_WEB_ENABLED === '1');
+  const localWebEnabled = services
+    ? services.length > 0
+    : (options.localWebEnabled ?? (process.env.CODEX_LOCAL_WEB_ENABLED !== '0'));
   const codexHome = options.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
   const relayUrl =
     options.relayUrl || process.env.CODEX_RELAY_URL || 'ws://127.0.0.1:3280/ws/agent';
-  const relayCaFile = options.relayCaFile || process.env.CODEX_RELAY_CA_FILE;
+  const relayCaFile = options.relayCaFile || (!options.codexHome ? process.env.CODEX_RELAY_CA_FILE : undefined);
   const relayCa = relayCaFile ? fs.readFileSync(relayCaFile) : undefined;
-  const codexBin = options.codexBin || process.env.CODEX_BIN || 'codex';
   const defaultCwd = options.defaultCwd || process.cwd();
-  const requiresE2E = options.requiresE2E ?? process.env.CODEX_DISABLE_E2E !== '1';
-  let currentProfile = options.profile ?? process.env.CODEX_PROFILE ?? null;
 
   const identity = loadOrCreateAgentIdentity(codexHome);
   const agentName = options.agentName || process.env.CODEX_AGENT_NAME || os.hostname();
-  const verifier = new E2EVerifier(identity.localSigningKey);
-
-  let codexProc = null;
-  let codexReady = false;
-  let codexReadyResolve = null;
-  let codexReadyPromise = Promise.resolve();
-  let cachedModels = null;
-  let cachedConfig = null;
-  let internalReqSeq = 900000;
-  /** @type {Map<string | number, { resolve: Function, reject: Function }>} */
-  const internalPending = new Map();
-  /** @type {Map<string | number, { clientId: string, method: string, threadId?: string }>} */
-  const clientRequestOwners = new Map();
-  /** @type {Set<string>} */
-  const activeTurnThreads = new Set();
-  let recycleTimer = null;
-  const pendingTurnStarts = new Set();
-  const activeTurns = new Map();
-  const completedTurns = new Set();
-  const requestTimeoutMs = options.requestTimeoutMs ?? 30000;
-  let processEpoch = null;
-  let stateRevision = 0;
-  let serverStatus = codexEnabled ? 'starting' : 'disabled';
-  let serverError = null;
-  let processRestartTimer = null;
-  let resettingProcess = false;
-  const interactions = new AgentInteractions({
-    write: (response) => writeToCodex(response),
-    timeoutMs: Math.min(requestTimeoutMs, 15000),
-    changed: () => { if (!resettingProcess) publishAgentState(); },
-  });
-
-  function agentSnapshot() {
-    return {
-      version: 1, epoch: processEpoch, revision: stateRevision,
-      status: serverStatus, error: serverError,
-      activeTurns: [...activeTurns.values()], requests: interactions.snapshot(),
-    };
-  }
-
-  function publishAgentState() {
-    stateRevision++;
-    activeWs?.send({ type: 'agent/codex_status', status: serverStatus });
-    activeWs?.send({ type: 'agent/rpc', clientId: null,
-      payload: { method: 'remote/agentState', params: agentSnapshot() } });
-  }
-
-  function replyToClient(clientId, id, result, error) {
-    if (id === undefined) return;
-    activeWs?.send({ type: 'agent/rpc', clientId,
-      payload: { id, ...(error ? { error: { code: -32000, message: error.message || String(error) } } : { result }) } });
-  }
-
-  function clearProcessRequests(reason) {
-    resettingProcess = true;
-    for (const pending of internalPending.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error(reason));
-    }
-    internalPending.clear();
-    for (const [id, pending] of clientRequestOwners) {
-      clearTimeout(pending.timer);
-      replyToClient(pending.clientId, id, null, new Error(reason));
-    }
-    clientRequestOwners.clear();
-    pendingTurnStarts.clear();
-    activeTurnThreads.clear();
-    activeTurns.clear();
-    completedTurns.clear();
-    interactions.reset(processEpoch, reason);
-    resettingProcess = false;
-    codexReady = false;
-    codexReadyResolve?.();
-  }
-
-  function failProcess(proc, reason) {
-    if (proc !== codexProc) return;
-    codexProc = null;
-    killCodexProcTree(proc);
-    serverStatus = 'error';
-    serverError = reason;
-    clearProcessRequests(reason);
-    publishAgentState();
-    if (!stopped && !processRestartTimer) {
-      processRestartTimer = setTimeout(() => {
-        processRestartTimer = null;
-        if (!stopped) spawnCodexAppServer();
-      }, options.restartDelayMs ?? 1000);
-      processRestartTimer.unref();
-    }
-  }
-  let lockReleaseNeeded = false;
 
   let activeWs = null;
   let stopped = false;
   let reconnectTimer = null;
   let dshManager = null;
   let opencodeManager = null;
-  let desktopManager = null;
+  let t3CodeManager = null;
   const httpServiceStates = new Map(), serviceProbes = new Set();
+
+  function serviceStatus(service) {
+    if (service.kind === 'dsh') return dshManager?.status.status || 'starting';
+    if (service.kind === 'opencode') return opencodeManager?.status.status || 'starting';
+    if (service.kind === 't3-code') return t3CodeManager?.status || 'starting';
+    return httpServiceStates.get(service.port) || 'starting';
+  }
+
   function registeredServices() {
-    return services?.map(service => ({ ...service,
-      status: service.kind === 'dsh' ? dshManager?.status.status || 'starting' : service.kind === 'opencode' ? opencodeManager?.status.status || 'starting' : httpServiceStates.get(service.port) || 'starting',
-      ...(service.kind === 'dsh' && dshManager?.credentials ? { auth: { ...service.auth, token: dshManager.credentials.token,
-        headers: { ...service.auth?.headers, cookie: dshManager.credentials.cookie } } } : {}),
-      ...(service.kind === 'opencode' && opencodeManager?.credentials ? { auth: { ...service.auth,
-        headers: { ...service.auth?.headers, authorization: opencodeManager.credentials.authorization } } } : {}),
+    return services?.map(service => ({
+      ...service,
+      // T3 Code uses the generic relay; the Agent injects its session at the loopback hop.
+      kind: service.kind === 't3-code' ? 'http' : service.kind,
+      status: serviceStatus(service),
+      ...(service.kind === 'dsh' && dshManager?.credentials ? {
+        auth: {
+          ...service.auth,
+          token: dshManager.credentials.token,
+          headers: { ...service.auth?.headers, cookie: dshManager.credentials.cookie },
+        },
+      } : {}),
+      ...(service.kind === 'opencode' && opencodeManager?.credentials ? {
+        auth: {
+          ...service.auth,
+          headers: { ...service.auth?.headers, authorization: opencodeManager.credentials.authorization },
+        },
+      } : {}),
     }));
   }
+
   const nativeServicesFile = path.join(codexHome, 'remote-native-services.json');
   function saveNativeServices() {
     if (!services) return;
     const entries = services.filter(service => service.kind !== 'http').map(service => {
       const url = new URL(`http://127.0.0.1:${service.port}/`);
       if (service.kind === 'dsh' && dshManager?.credentials) url.searchParams.set('token', dshManager.credentials.token);
-      return { id: service.id, name: service.name, url: url.href,
-        ...(service.kind === 'opencode' && opencodeManager?.credentials ? { username: opencodeManager.credentials.username, password: opencodeManager.credentials.password } : {}),
-        status: service.kind === 'dsh' ? dshManager?.status.status || 'starting' : opencodeManager?.status.status || 'starting' };
+      return {
+        id: service.id,
+        name: service.name,
+        url: url.href,
+        ...(service.kind === 'opencode' && opencodeManager?.credentials ? {
+          username: opencodeManager.credentials.username,
+          password: opencodeManager.credentials.password,
+        } : {}),
+        status: serviceStatus(service),
+      };
     });
     const temporary = nativeServicesFile + '.' + crypto.randomBytes(6).toString('hex');
-    fs.writeFileSync(temporary, JSON.stringify(entries, null, 2) + '\n', { mode: 0o600 }); fs.renameSync(temporary, nativeServicesFile);
+    fs.writeFileSync(temporary, JSON.stringify(entries, null, 2) + '\n', { mode: 0o600 });
+    fs.renameSync(temporary, nativeServicesFile);
   }
-  function publishServices() { if (services) { saveNativeServices(); activeWs?.send({ type: 'agent/services', webServices: registeredServices() }); } }
+
+  function publishServices() {
+    if (services) {
+      saveNativeServices();
+      activeWs?.send({ type: 'agent/services', webServices: registeredServices() });
+    }
+  }
+
   function probeServices() {
     for (const service of services || []) {
       if (service.kind !== 'http') continue;
-      const socket = net.connect({ host: '127.0.0.1', port: service.port }); serviceProbes.add(socket);
+      const socket = net.connect({ host: '127.0.0.1', port: service.port });
+      serviceProbes.add(socket);
       let settled = false;
       const finish = status => {
-        if (settled) return; settled = true; socket.destroy(); serviceProbes.delete(socket);
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        serviceProbes.delete(socket);
         if (stopped || !services.some(entry => entry.port === service.port) || httpServiceStates.get(service.port) === status) return;
-        httpServiceStates.set(service.port, status); publishServices();
+        httpServiceStates.set(service.port, status);
+        publishServices();
       };
-      socket.setTimeout(1000, () => finish('error')); socket.once('connect', () => finish('ready')); socket.once('error', () => finish('error'));
+      socket.setTimeout(1000, () => finish('error'));
+      socket.once('connect', () => finish('ready'));
+      socket.once('error', () => finish('error'));
     }
   }
-  const managedSignature = list => JSON.stringify(list.filter(service => service.kind !== 'http').map(({ id, kind, port }) => ({ id, kind, port })));
+
+  const managedSignature = list => JSON.stringify(
+    list.filter(service => service.kind !== 'http').map(({ id, kind, port }) => ({ id, kind, port }))
+  );
   const reloadServices = () => {
     try {
       const next = readWebServices(servicesFile);
       if (JSON.stringify(next) === JSON.stringify(services)) return;
-      if (managedSignature(next) !== managedSignature(services)) throw new Error('托管应用的启动配置变化，请重启 Agent');
-      services = next; publishServices(); probeServices();
+      if (managedSignature(next) !== managedSignature(services)) {
+        throw new Error('托管应用的启动配置变化，请重启 Agent');
+      }
+      services = next;
+      publishServices();
+      probeServices();
       if (!options.quiet) console.log('[web-services] Service spec reloaded');
-    } catch { if (!options.quiet) console.warn('[web-services] Spec not applied; check JSON/schema, or restart Agent after changing managed application startup settings'); }
+    } catch {
+      if (!options.quiet) {
+        console.warn('[web-services] Spec not applied; check JSON/schema, or restart Agent after changing managed application startup settings');
+      }
+    }
   };
-  if (servicesFile && options.webServices === undefined) fs.watchFile(servicesFile, { interval: 2000, persistent: false }, reloadServices);
-  const serviceProbeTimer = services ? setInterval(probeServices, 5000) : null; serviceProbeTimer?.unref();
-  if (services) probeServices();
-  const localBridge = createDshAgentBridge({ service: 'local', getTarget: (message) => {
-    if (!localWebEnabled || !Number.isInteger(message.port) || message.port < 1 || message.port > 65535) throw new Error('Invalid local web port');
-    const service = services?.find(entry => entry.port === message.port);
-    if (services && !service) throw new Error('Local web service is not registered');
-    return { base: `http://127.0.0.1:${message.port}`, rewriteResponse: service?.kind === 'opencode'
-      ? openCodeRewriter(identity.agentId, { prefix: `/local/${identity.agentId}/${message.port}` }) : localWebRewriter(identity.agentId, message.port) };
-  } });
-  const desktopBridge = createDshAgentBridge({ service: 'desktop', getTarget: async () => {
-    if (!desktopManager) throw new Error('Desktop is disabled');
-    return desktopManager.target();
-  } });
-  if (desktopEnabled) {
-    desktopManager = startManagedDesktop({ agentId: identity.agentId,
-      wayvncBin: options.wayvncBin || process.env.CODEX_WAYVNC_BIN || 'wayvnc',
-      websockifyBin: options.websockifyBin || process.env.CODEX_WEBSOCKIFY_BIN || 'websockify',
-      novncDir: options.novncDir || process.env.CODEX_NOVNC_DIR || '/usr/share/novnc',
-      output: options.desktopOutput || process.env.CODEX_DESKTOP_OUTPUT,
-      fps: Number(options.desktopFps ?? process.env.CODEX_DESKTOP_FPS ?? 12), quiet: options.quiet,
-      onStatus: (desktopWeb) => activeWs?.send({ type: 'agent/desktop_status', desktopWeb }),
-      onRestart: () => desktopBridge.disconnect(true),
-    });
+  if (servicesFile && options.webServices === undefined) {
+    fs.watchFile(servicesFile, { interval: 2000, persistent: false }, reloadServices);
   }
-  const opencodeBridge = createDshAgentBridge({ service: 'opencode', rewriteResponse: openCodeRewriter(identity.agentId),
-    getTarget: async () => {
-      if (!opencodeManager) throw new Error('OpenCode is disabled');
-      return opencodeManager.target();
+  const serviceProbeTimer = services ? setInterval(probeServices, 5000) : null;
+  serviceProbeTimer?.unref();
+  if (services) probeServices();
+
+  const localBridge = createLocalAgentBridge({
+    getTarget: async (message) => {
+      if (!localWebEnabled || !Number.isInteger(message.port) || message.port < 1 || message.port > 65535) {
+        throw new Error('Invalid local web port');
+      }
+      const service = services?.find(entry => entry.port === message.port);
+      if (services && !service) throw new Error('Local web service is not registered');
+      const target = service?.kind === 't3-code'
+        ? await t3CodeManager.target()
+        : { base: `http://127.0.0.1:${message.port}` };
+      return {
+        ...target,
+        rewriteResponse: service?.kind === 'opencode'
+          ? openCodeRewriter(identity.agentId, { prefix: `/local/${identity.agentId}/${message.port}` })
+          : localWebRewriter(identity.agentId, message.port),
+      };
     },
   });
-  if (opencodeEnabled) {
+
+  const t3CodeService = serviceOf('t3-code');
+  if (t3CodeService) {
+    t3CodeManager = startManagedT3Code({
+      bin: options.t3CodeBin || process.env.CODEX_T3_CODE_BIN || 't3',
+      port: t3CodeService.port,
+      cwd: defaultCwd,
+      quiet: options.quiet,
+      onStatus: publishServices,
+      onRestart: () => localBridge.disconnect(true, t3CodeService.port),
+    });
+  }
+
+  const opencodeService = serviceOf('opencode');
+  if (opencodeService) {
     opencodeManager = startManagedOpenCode({
       bin: options.opencodeBin || process.env.CODEX_OPENCODE_BIN || 'opencode',
-      port: serviceOf('opencode')?.port ?? Number(options.opencodePort ?? process.env.CODEX_OPENCODE_PORT ?? 3082),
-      passwordRequired: !services,
+      port: opencodeService.port,
+      passwordRequired: false,
       cwd: options.opencodeCwd || process.env.CODEX_OPENCODE_CWD || defaultCwd,
       quiet: options.quiet,
-      onStatus: (opencodeWeb) => { activeWs?.send({ type: 'agent/opencode_status', opencodeWeb }); publishServices(); },
-      onRestart: () => { opencodeBridge.disconnect(true); localBridge.disconnect(true, serviceOf('opencode')?.port); },
+      onStatus: publishServices,
+      onRestart: () => localBridge.disconnect(true, opencodeService.port),
     });
   }
-  const dshEnabled = services ? Boolean(serviceOf('dsh')) : options.dshEnabled ?? process.env.CODEX_DSH_ENABLED === '1';
-  const dshBridge = createDshAgentBridge({ getTarget: async () => {
-    if (!dshManager) throw new Error('DSH Web is disabled');
-    return dshManager.target();
-  } });
-  if (dshEnabled) {
-    const relay = new URL(relayUrl);
-    const publicUrl = `${relay.protocol === 'wss:' ? 'https:' : 'http:'}//${relay.host}/dsh/${identity.agentId}/`;
+
+  const dshService = serviceOf('dsh');
+  if (dshService) {
     dshManager = startManagedDsh({
       bin: options.dshBin || process.env.CODEX_DSH_BIN || 'dsh',
-      port: serviceOf('dsh')?.port ?? Number(options.dshPort ?? process.env.CODEX_DSH_PORT ?? 3081),
+      port: dshService.port,
       cwd: options.dshCwd || process.env.CODEX_DSH_CWD || os.homedir(),
-      publicUrl: services ? undefined : publicUrl, quiet: options.quiet,
-      onStatus: (dshWeb) => { activeWs?.send({ type: 'agent/dsh_status', dshWeb }); publishServices(); },
-      onRestart: () => { dshBridge.disconnect(true); localBridge.disconnect(true, serviceOf('dsh')?.port); },
+      quiet: options.quiet,
+      onStatus: publishServices,
+      onRestart: () => localBridge.disconnect(true, dshService.port),
     });
-  }
-
-  function killCodexProcTree(proc) {
-    if (!proc) return;
-    try {
-      if (proc.pid) process.kill(-proc.pid, 'SIGTERM');
-    } catch {
-      // ignore
-    }
-    try {
-      proc.kill('SIGTERM');
-    } catch {
-      // ignore
-    }
-  }
-
-  function scheduleLockReleaseRecycle() {
-    lockReleaseNeeded = true;
-    if (recycleTimer) clearTimeout(recycleTimer);
-    recycleTimer = setTimeout(() => {
-      recycleTimer = null;
-      if (!stopped && activeTurnThreads.size === 0 && pendingTurnStarts.size === 0 && interactions.pending.size === 0 &&
-          internalPending.size === 0 && clientRequestOwners.size === 0) {
-        // Recycle codex app-server process tree so all ~/.codex/thread-writer-locks/*.lock FDs are immediately released for local Desktop App
-        lockReleaseNeeded = false;
-        spawnCodexAppServer();
-      }
-    }, 350);
-    recycleTimer.unref();
-  }
-
-  function spawnCodexAppServer() {
-    if (!codexEnabled) return;
-    if (processRestartTimer) { clearTimeout(processRestartTimer); processRestartTimer = null; }
-    clearProcessRequests('本机 Codex 已重启，未完成的操作已中断，请刷新会话');
-    processEpoch = crypto.randomUUID();
-    interactions.reset(processEpoch);
-    serverStatus = 'starting';
-    serverError = null;
-    publishAgentState();
-    if (recycleTimer) {
-      clearTimeout(recycleTimer);
-      recycleTimer = null;
-    }
-    if (codexProc) {
-      const prev = codexProc;
-      codexProc = null;
-      killCodexProcTree(prev);
-    }
-
-    const args = [];
-    if (currentProfile) {
-      args.push('--profile', currentProfile);
-    }
-    args.push('app-server');
-
-    codexReady = false;
-    codexReadyPromise = new Promise((resolve) => {
-      codexReadyResolve = resolve;
-    });
-
-    const proc = spawn(codexBin, args, {
-      cwd: defaultCwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, CODEX_HOME: codexHome },
-      detached: true,
-    });
-    codexProc = proc;
-
-    let stdoutBuf = '';
-    proc.stdout.on('data', (chunk) => {
-      if (proc !== codexProc) return;
-      stdoutBuf += chunk.toString('utf8');
-      const lines = stdoutBuf.split('\n');
-      stdoutBuf = lines.pop() ?? '';
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        handleCodexStdoutLine(line);
-      }
-    });
-
-    proc.stderr.on('data', (chunk) => {
-      if (!options.quiet && process.env.CODEX_DEBUG === '1') {
-        process.stderr.write(`[codex-stderr] ${chunk}`);
-      }
-    });
-
-    proc.stdin.on('error', () => failProcess(proc, 'Codex 通信中断，未完成的操作已结束'));
-    proc.on('error', () => failProcess(proc, '无法启动 Codex，请检查 CODEX_BIN 和本机安装'));
-    proc.on('exit', (code) => failProcess(proc, `Codex 进程已退出（${code ?? 'signal'}），正在恢复连接`));
-
-    // Perform JSON-RPC initialize handshake
-    sendInternalRpc('initialize', {
-      clientInfo: {
-        name: 'codex-remote-agent',
-        title: 'Codex Mobile Remote Agent',
-        version: '1.0.0',
-      },
-      capabilities: { experimentalApi: true },
-    })
-      .then(() => {
-        if (proc !== codexProc) return;
-        writeToCodex({ method: 'initialized' });
-        codexReady = true;
-        serverStatus = 'ready';
-        serverError = null;
-        publishAgentState();
-        if (codexReadyResolve) codexReadyResolve();
-        // Pre-warm models and config in background for instant UI loading
-        if (!cachedModels) {
-          sendInternalRpc('model/list', {})
-            .then((res) => {
-              if (Array.isArray(res?.data)) cachedModels = res.data;
-            })
-            .catch(() => {});
-        }
-        if (!cachedConfig) {
-          sendInternalRpc('config/read', {})
-            .then((res) => {
-              if (res?.config) cachedConfig = res.config;
-            })
-            .catch(() => {});
-        }
-      })
-      .catch(() => {
-        failProcess(proc, 'Codex 初始化失败或超时，正在重启');
-      });
-  }
-
-  function writeToCodex(obj) {
-    if (!codexProc?.stdin.writable || codexProc.stdin.destroyed) return false;
-    try { codexProc.stdin.write(`${JSON.stringify(obj)}\n`); return true; } catch { return false; }
-  }
-
-  function sendInternalRpc(method, params) {
-    return new Promise((resolve, reject) => {
-      const id = `internal_${++internalReqSeq}`;
-      const epoch = processEpoch;
-      const timer = setTimeout(() => {
-        if (internalPending.get(id)?.epoch !== epoch) return;
-        internalPending.delete(id);
-        reject(new Error(`Codex 请求 ${method} 超时`));
-        if (lockReleaseNeeded) scheduleLockReleaseRecycle();
-      }, requestTimeoutMs);
-      timer.unref();
-      internalPending.set(id, { resolve, reject, timer, epoch });
-      if (!writeToCodex({ id, method, params })) {
-        clearTimeout(timer);
-        internalPending.delete(id);
-        reject(new Error('Codex 连接不可写'));
-      }
-    });
-  }
-
-  function handleCodexStdoutLine(line) {
-    let msg;
-    try {
-      msg = JSON.parse(line);
-    } catch {
-      return;
-    }
-
-    // Check if it's a response to an internal request
-    if (msg.id !== undefined && internalPending.has(msg.id)) {
-      const handler = internalPending.get(msg.id);
-      internalPending.delete(msg.id);
-      clearTimeout(handler.timer);
-      if (lockReleaseNeeded) scheduleLockReleaseRecycle();
-      if (msg.error) {
-        handler.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
-      } else {
-        handler.resolve(msg.result);
-      }
-      return;
-    }
-
-    if (msg.id !== undefined && msg.method === 'currentTime/read') {
-      writeToCodex({ id: msg.id, result: { currentTimeAt: Math.floor(Date.now() / 1000) } });
-      return;
-    }
-    if (msg.id !== undefined && typeof msg.method === 'string') {
-      const payload = interactions.capture(msg);
-      activeWs?.send({ type: 'agent/rpc', clientId: null, payload });
-      return;
-    }
-    if (msg.method === 'serverRequest/resolved') {
-      msg.requestEpoch = processEpoch;
-      interactions.resolve(msg.params?.requestId);
-    }
-    if (msg.method === 'turn/started' && msg.params?.threadId) {
-      const { threadId, turn } = msg.params;
-      completedTurns.delete(JSON.stringify([threadId, turn?.id]));
-      activeTurnThreads.add(threadId);
-      activeTurns.set(threadId, { threadId, turnId: turn?.id, status: 'running' });
-    }
-    if (msg.method === 'error' && msg.params?.threadId) {
-      const turn = activeTurns.get(msg.params.threadId);
-      if (turn) { turn.status = msg.params.willRetry ? 'retrying' : 'failed'; turn.message = msg.params.error?.message; }
-    }
-    const startingThisThread = [...clientRequestOwners.values()].some((entry) =>
-      entry.method === 'turn/start' && entry.threadId === msg.params?.threadId);
-    const idleFinished = msg.method === 'thread/status/changed' && msg.params?.status?.type === 'idle' &&
-      activeTurnThreads.has(msg.params?.threadId) && !startingThisThread && pendingTurnStarts.size === 0;
-    if ((msg.method === 'turn/completed' || idleFinished) && msg.params?.threadId) {
-      const threadId = msg.params.threadId;
-      completedTurns.add(JSON.stringify([threadId, msg.params.turn?.id]));
-      while (completedTurns.size > 200) completedTurns.delete(completedTurns.values().next().value);
-      activeTurnThreads.delete(threadId);
-      activeTurns.delete(threadId);
-      interactions.cancelThread(threadId, '当前轮次已结束，该交互已失效');
-      scheduleLockReleaseRecycle();
-      if (idleFinished) activeWs?.send({ type: 'agent/rpc', clientId: null,
-        payload: { method: 'turn/completed', params: { threadId, turn: { id: 'idle', status: 'completed' } } } });
-    }
-
-    // Otherwise forward to Cloud Relay
-    let ownerClientId = null;
-    if (msg.id !== undefined && msg.method === undefined && clientRequestOwners.has(msg.id)) {
-      const request = clientRequestOwners.get(msg.id);
-      ownerClientId = request.clientId;
-      clientRequestOwners.delete(msg.id);
-      clearTimeout(request.timer);
-      if (request.method === 'turn/start' && msg.error) {
-        activeTurnThreads.delete(request.threadId);
-        activeTurns.delete(request.threadId);
-        scheduleLockReleaseRecycle();
-      } else if (request.method === 'turn/start' && msg.result?.turn) {
-        const turn = msg.result.turn;
-        if (!completedTurns.has(JSON.stringify([request.threadId, turn.id])) &&
-            !['completed', 'failed', 'interrupted'].includes(turn.status)) {
-          activeTurnThreads.add(request.threadId);
-          if (activeTurns.get(request.threadId)?.turnId !== turn.id) {
-            activeTurns.set(request.threadId, { threadId: request.threadId, turnId: turn.id, status: 'running' });
-          }
-        } else if (!activeTurns.has(request.threadId)) activeTurnThreads.delete(request.threadId);
-      }
-      if (lockReleaseNeeded) scheduleLockReleaseRecycle();
-    }
-
-    if (activeWs && activeWs.readyState === 1) {
-      activeWs.send({
-        type: 'agent/rpc',
-        clientId: ownerClientId,
-        payload: msg,
-      });
-    }
-    if (msg.method?.startsWith('turn/') || msg.method === 'error' || msg.method === 'thread/status/changed' ||
-        msg.method === 'serverRequest/resolved' || msg.id !== undefined) publishAgentState();
-  }
-
-  async function handleClientRpcMessage(msg) {
-    const { clientId, payload, e2e } = msg;
-    if (!payload || typeof payload !== 'object') return;
-
-    const isClientResponseToServerRequest =
-      payload.id !== undefined && payload.method === undefined && (payload.result !== undefined || payload.error !== undefined);
-    const isReadOnlyMethod = payload.method && READ_ONLY_METHODS.has(payload.method);
-
-    // Verify E2E signature for mutating methods and server request approval responses
-    if (requiresE2E && !isReadOnlyMethod) {
-      const bodyString = JSON.stringify(payload);
-      const check = verifier.verify({
-        timestamp: e2e?.timestamp,
-        nonce: e2e?.nonce,
-        signature: e2e?.signature,
-        bodyString,
-      });
-      if (!check.ok) {
-        if (activeWs && activeWs.readyState === 1) {
-          activeWs.send({
-            type: 'agent/e2e_error',
-            clientId,
-            requestId: payload.id ?? null,
-            reason: `本机端到端安全验签未通过 (${check.reason})，请确认手机端已填入本机配对密钥`,
-          });
-        }
-        return;
-      }
-    }
-
-    if (payload.method === 'remote/getAgentState') {
-      replyToClient(clientId, payload.id, agentSnapshot());
-      return;
-    }
-    if (!codexEnabled) {
-      replyToClient(clientId, payload.id, null, new Error('该设备未启用 Codex，请选择 DSH 或 OpenCode 入口'));
-      return;
-    }
-    if (payload.method === 'remote/respondToRequest') {
-      try { replyToClient(clientId, payload.id, await interactions.submit(payload.params || {})); }
-      catch (error) { replyToClient(clientId, payload.id, null, error); }
-      return;
-    }
-    if (isClientResponseToServerRequest) {
-      try {
-        await interactions.submit({ requestId: payload.id, requestEpoch: processEpoch,
-          result: payload.result, error: payload.error });
-      } catch (error) {
-        activeWs?.send({ type: 'agent/e2e_error', clientId, requestId: payload.id, reason: error.message });
-      }
-      return;
-    }
-    const epoch = processEpoch;
-    if (!codexReady) await codexReadyPromise;
-    if (!codexReady || epoch !== processEpoch) {
-      replyToClient(clientId, payload.id, null, new Error('Codex 正在重启或尚未就绪，请稍后重试'));
-      return;
-    }
-
-    // Handle synthetic composite RPC: remote/getWorkspacesAndThreads
-    if (payload.method === 'remote/getWorkspacesAndThreads') {
-      try {
-        const desktop = readDesktopGlobalWorkspaces(codexHome);
-        const threadRes = await sendInternalRpc('thread/list', {
-          limit: payload.params?.limit ?? 100,
-          cursor: payload.params?.cursor || undefined,
-          sortKey: 'updated_at',
-          sortDirection: 'desc',
-          useStateDbOnly: true,
-          modelProviders: [],
-          sourceKinds: ['cli', 'vscode', 'appServer', 'exec', 'unknown'],
-        });
-
-        const threads = Array.isArray(threadRes?.data) ? threadRes.data : [];
-        // Enrich threads with desktop projectId assignment if present
-        for (const t of threads) {
-          if (!t.projectId && desktop.threadProjectAssignments[t.id]) {
-            t.projectId = desktop.threadProjectAssignments[t.id];
-          }
-        }
-
-        // Also build workspace entries for any cwd in threads not yet covered by desktop.projects
-        const coveredRoots = new Set();
-        for (const p of desktop.projects) {
-          for (const r of p.rootPaths) coveredRoots.add(r);
-        }
-
-        const extraCwdMap = new Map();
-        for (const t of threads) {
-          if (!t.cwd) continue;
-          // Check if t.cwd matches any desktop project root
-          let matchedProject = null;
-          for (const p of desktop.projects) {
-            if (p.id === t.projectId || p.rootPaths.includes(t.cwd)) {
-              matchedProject = p.id;
-              break;
-            }
-          }
-          if (matchedProject) {
-            t.projectId = matchedProject;
-          } else {
-            if (!extraCwdMap.has(t.cwd)) {
-              const syntheticId = `cwd:${t.cwd}`;
-              extraCwdMap.set(t.cwd, {
-                id: syntheticId,
-                name: path.basename(t.cwd) || t.cwd,
-                rootPaths: [t.cwd],
-                updatedAt: (t.updatedAt || 0) * 1000,
-                isAutoDiscovered: true,
-              });
-            }
-            t.projectId = `cwd:${t.cwd}`;
-          }
-        }
-
-        const mergedProjects = [
-          ...desktop.projects,
-          ...Array.from(extraCwdMap.values()),
-        ];
-
-        if (!cachedConfig) {
-          try {
-            const cfgRes = await Promise.race([
-              sendInternalRpc('config/read', {}),
-              new Promise((r) => setTimeout(() => r(null), 400)),
-            ]);
-            if (cfgRes?.config) cachedConfig = cfgRes.config;
-          } catch {
-            // ignore
-          }
-        }
-
-        if (!cachedModels) {
-          try {
-            const mdlRes = await Promise.race([
-              sendInternalRpc('model/list', {}),
-              new Promise((r) => setTimeout(() => r(null), 600)),
-            ]);
-            if (Array.isArray(mdlRes?.data)) cachedModels = mdlRes.data;
-          } catch {
-            // ignore
-          }
-        }
-
-        const compactModels = Array.isArray(cachedModels)
-          ? cachedModels
-              .filter((m) => !m.hidden)
-              .map((m) => ({
-                id: m.id || m.model,
-                displayName: m.displayName || m.id || m.model,
-                description: m.description || '',
-                defaultReasoningEffort: m.defaultReasoningEffort || 'medium',
-                isDefault: Boolean(m.isDefault),
-                efforts: Array.isArray(m.supportedReasoningEfforts)
-                  ? m.supportedReasoningEfforts.map((e) => e.reasoningEffort)
-                  : ['low', 'medium', 'high', 'xhigh'],
-              }))
-          : [];
-
-        if (activeWs && activeWs.readyState === 1) {
-          activeWs.send({
-            type: 'agent/rpc',
-            clientId,
-            payload: {
-              id: payload.id,
-              result: {
-                projects: mergedProjects,
-                threads,
-                threadSortKey: 'updated_at',
-                nextCursor: threadRes?.nextCursor || null,
-                defaultCwd,
-                profile: currentProfile,
-                models: compactModels,
-                currentModel: cachedConfig?.model || threads[0]?.model || 'gpt-6-astra',
-                currentEffort:
-                  cachedConfig?.model_reasoning_effort ||
-                  threads[0]?.reasoningEffort ||
-                  'xhigh',
-              },
-            },
-          });
-        }
-      } catch (err) {
-        if (activeWs && activeWs.readyState === 1) {
-          activeWs.send({
-            type: 'agent/rpc',
-            clientId,
-            payload: {
-              id: payload.id,
-              error: { code: -32000, message: err.message },
-            },
-          });
-        }
-      }
-      return;
-    }
-
-    // Handle profile switch request from mobile UI
-    if (payload.method === 'remote/switchProfile') {
-      if (activeTurnThreads.size || interactions.pending.size || pendingTurnStarts.size) {
-        replyToClient(clientId, payload.id, null, new Error('请先等待当前任务结束或停止任务，再切换 Profile'));
-        return;
-      }
-      currentProfile = payload.params?.profile ? String(payload.params.profile).trim() : null;
-      spawnCodexAppServer();
-      if (activeWs && activeWs.readyState === 1) {
-        activeWs.send({
-          type: 'agent/rpc',
-          clientId,
-          payload: {
-            id: payload.id,
-            result: { ok: true, profile: currentProfile },
-          },
-        });
-      }
-      return;
-    }
-
-    // Resume only unloaded threads. A freshly started thread is already in memory,
-    // but its rollout is not persisted until the first turn, so resume would fail.
-    // Keep the auto-fork fallback when Desktop App holds a historical thread's writer lock.
-    if (payload.method === 'turn/start' && payload.params?.threadId) {
-      const startToken = {};
-      pendingTurnStarts.add(startToken);
-      if (recycleTimer) {
-        clearTimeout(recycleTimer);
-        recycleTimer = null;
-      }
-      let targetThreadId = payload.params.threadId;
-      try {
-        try {
-          let loaded = false, cursor;
-          do {
-            const page = await sendInternalRpc('thread/loaded/list', { cursor, limit: 100 });
-            if (!Array.isArray(page?.data)) throw new Error('Codex 未返回已加载的会话列表');
-            loaded = page.data.includes(targetThreadId);
-            cursor = page.nextCursor;
-          } while (!loaded && cursor);
-          if (!loaded) await sendInternalRpc('thread/resume', { threadId: targetThreadId, excludeTurns: true });
-        } catch (error) {
-          if (!String(error.message).includes('already has an active writer')) throw error;
-          const forkRes = await sendInternalRpc('thread/fork', { threadId: targetThreadId, excludeTurns: true });
-          const forkedThread = forkRes?.thread || forkRes;
-          if (!forkedThread?.id) throw new Error('分叉会话未返回有效 ID');
-          const originalThreadId = targetThreadId;
-          targetThreadId = forkedThread.id;
-          payload.params.threadId = targetThreadId;
-          activeWs?.send({ type: 'agent/rpc', clientId,
-            payload: { method: 'remote/threadForked', params: { oldThreadId: originalThreadId, newThreadId: targetThreadId } } });
-        }
-      } catch (error) {
-        replyToClient(clientId, payload.id, null, error);
-        return;
-      } finally {
-        pendingTurnStarts.delete(startToken);
-      }
-      if (epoch !== processEpoch || !codexReady) {
-        replyToClient(clientId, payload.id, null, new Error('Codex 已重启，本次消息未提交，请重新发送'));
-        return;
-      }
-      activeTurnThreads.add(targetThreadId);
-    }
-
-    // Track owner of standard client request
-    if (payload.id !== undefined && !isClientResponseToServerRequest && clientId) {
-      const timer = setTimeout(() => {
-        const pending = clientRequestOwners.get(payload.id);
-        if (!pending || pending.epoch !== epoch) return;
-        clientRequestOwners.delete(payload.id);
-        replyToClient(clientId, payload.id, null, new Error('Codex 请求超时，请同步状态后再决定是否重试'));
-        if (pending.method === 'turn/start' && !activeTurns.has(pending.threadId)) {
-          activeTurnThreads.delete(pending.threadId);
-          scheduleLockReleaseRecycle();
-        }
-        if (lockReleaseNeeded) scheduleLockReleaseRecycle();
-      }, requestTimeoutMs);
-      timer.unref();
-      clientRequestOwners.set(payload.id, {
-        clientId, method: payload.method, threadId: payload.params?.threadId, timer, epoch,
-      });
-    }
-
-    if (!writeToCodex(payload)) {
-      clearTimeout(clientRequestOwners.get(payload.id)?.timer);
-      clientRequestOwners.delete(payload.id);
-      if (payload.method === 'turn/start') activeTurnThreads.delete(payload.params?.threadId);
-      if (activeWs && activeWs.readyState === 1 && payload.method && payload.id !== undefined) {
-        activeWs.send({
-          type: 'agent/rpc', clientId,
-          payload: { id: payload.id, error: { code: -32000, message: 'codex app-server stdin not writable' } },
-        });
-      }
-    }
   }
 
   async function connectLoop() {
@@ -931,28 +260,17 @@ export function startLocalAgent(options = {}) {
       const ws = await connectRelayTransport(relayUrl, { ca: relayCa, mode: options.relayTransport });
       if (stopped) { ws.close(); return; }
       activeWs = ws;
-      dshBridge.attach((message) => ws.send(message));
-      opencodeBridge.attach((message) => ws.send(message));
-      desktopBridge.attach((message) => ws.send(message));
       localBridge.attach((message) => ws.send(message));
 
       ws.send({
         type: 'agent/register',
-        dshWeb: dshManager?.status || { enabled: false, status: 'disabled' },
-        opencodeWeb: opencodeManager?.status || { enabled: false, status: 'disabled' },
-        desktopWeb: desktopManager?.status || { enabled: false, status: 'disabled' },
         localWeb: { enabled: localWebEnabled, status: localWebEnabled ? 'ready' : 'disabled' },
         webServices: registeredServices(),
-        codexEnabled,
-        codexStatus: serverStatus,
         agentId: identity.agentId,
         name: agentName,
         hostname: os.hostname(),
         platform: `${os.platform()}-${os.arch()}`,
         defaultCwd,
-        profile: currentProfile,
-        requiresE2E,
-        e2eKeyFingerprint: identity.e2eKeyFingerprint,
         fileUploads: true,
         fileUploadToken: registrationUploadToken(codexHome, relayUrl, identity.agentId),
       });
@@ -966,18 +284,14 @@ export function startLocalAgent(options = {}) {
           return;
         }
 
-        if (dshBridge.handle(msg)) return;
-        if (opencodeBridge.handle(msg)) return;
-        if (desktopBridge.handle(msg)) return;
         if (localBridge.handle(msg)) return;
 
         if (msg.type === 'relay/registered') {
           if (!msg.trusted) clearUploadCredentials(codexHome, relayUrl);
-          publishAgentState();
           if (!options.quiet) {
             console.log(
               `✅ Connected to Cloud Relay (${relayUrl}) | Trusted: ${
-                msg.trusted ? 'YES' : 'PENDING (请在手机网页顶部点击【信任该设备】)'
+                msg.trusted ? 'YES' : 'PENDING (请在网页顶部点击【信任并绑定】)'
               }`
             );
           }
@@ -987,7 +301,7 @@ export function startLocalAgent(options = {}) {
         if (msg.type === 'relay/trusted') {
           if (!msg.trusted) clearUploadCredentials(codexHome, relayUrl);
           if (!options.quiet) {
-            console.log(`🔒 Device trust updated by mobile user: ${msg.trusted ? 'TRUSTED' : 'UNTRUSTED'}`);
+            console.log(`🔒 Device trust updated: ${msg.trusted ? 'TRUSTED' : 'UNTRUSTED'}`);
           }
           return;
         }
@@ -995,16 +309,14 @@ export function startLocalAgent(options = {}) {
         if (msg.type === 'relay/fileUploadCredentials') {
           try { saveUploadCredentials(codexHome, relayUrl, identity.agentId, msg); }
           catch { if (!options.quiet) console.warn('[local-agent] 无法保存文件上传凭据，请检查本机配置目录权限'); }
-          return;
-        }
-
-        if (msg.type === 'relay/client_rpc') {
-          handleClientRpcMessage(msg).catch((error) => replyToClient(msg.clientId, msg.payload?.id, null, error));
         }
       });
 
       ws.on('close', () => {
-        if (activeWs === ws) { activeWs = null; dshBridge.disconnect(); opencodeBridge.disconnect(); desktopBridge.disconnect(); localBridge.disconnect(); }
+        if (activeWs === ws) {
+          activeWs = null;
+          localBridge.disconnect();
+        }
         if (!stopped) {
           reconnectTimer = setTimeout(connectLoop, 2500);
           reconnectTimer.unref();
@@ -1026,19 +338,14 @@ export function startLocalAgent(options = {}) {
     }
   }
 
-  spawnCodexAppServer();
   connectLoop();
 
   if (!options.quiet) {
     console.log('==========================================================');
-    console.log('💻 Codex Local Remote Agent Started');
+    console.log('💻 RemoteHub Local Agent Started');
     console.log(`🆔 Agent ID          : ${identity.agentId} (${agentName})`);
     console.log(`☁️  Cloud Relay URL   : ${relayUrl}`);
     console.log(`📂 Default Workspace : ${defaultCwd}`);
-    if (codexEnabled) console.log(`⚙️  Codex Profile     : ${currentProfile || '(default)'}`);
-    if (codexEnabled && requiresE2E) {
-      console.log('🔐 配对密钥已保存；在本机运行 codex-up --show-pairing-key 查看');
-    }
     console.log('==========================================================');
   }
 
@@ -1047,30 +354,18 @@ export function startLocalAgent(options = {}) {
     get connected() { return activeWs?.readyState === 1; },
     get dshStatus() { return dshManager?.status || { enabled: false, status: 'disabled' }; },
     get opencodeStatus() { return opencodeManager?.status || { enabled: false, status: 'disabled' }; },
-    get desktopStatus() { return desktopManager?.status || { enabled: false, status: 'disabled' }; },
     stop() {
       stopped = true;
-      dshBridge.disconnect();
-      dshManager?.stop();
-      opencodeBridge.disconnect();
-      opencodeManager?.stop();
-      desktopBridge.disconnect();
-      desktopManager?.stop();
       localBridge.disconnect();
-      clearInterval(serviceProbeTimer); serviceProbes.forEach(socket => socket.destroy());
+      dshManager?.stop();
+      opencodeManager?.stop();
+      t3CodeManager?.stop();
+      clearInterval(serviceProbeTimer);
+      serviceProbes.forEach(socket => socket.destroy());
       if (servicesFile) fs.unwatchFile(servicesFile, reloadServices);
       if (services) fs.rmSync(nativeServicesFile, { force: true });
-      if (recycleTimer) clearTimeout(recycleTimer);
-      if (processRestartTimer) clearTimeout(processRestartTimer);
-      clearProcessRequests('本机 Agent 已停止');
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      const relayClosed = activeWs?.close();
-      if (codexProc) {
-        const prev = codexProc;
-        codexProc = null;
-        killCodexProcTree(prev);
-      }
-      return relayClosed;
+      return activeWs?.close();
     },
   };
 }
@@ -1079,39 +374,22 @@ export function startLocalAgent(options = {}) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('用法：codex-up [--profile 名称] [--name 设备名] [--no-dsh] [--opencode] [--no-codex]\n' +
+    console.log('用法：codex-up [--name 设备名] [--services /path/to/services.json] [--local-web|--no-local-web]\n' +
       '      codex-up --upload 文件路径 [--name 下载名称]\n' +
-      '      codex-up --show-pairing-key\n' +
-      '      codex-up --services /path/to/services.json\n' +
       '      codex-up --show-local-services\n' +
       '      codex-up service install|start|stop|restart|status|logs|uninstall');
     process.exit(0);
   }
   let relayUrl = process.env.CODEX_RELAY_URL;
-  let profile = process.env.CODEX_PROFILE || null;
   let agentName = process.env.CODEX_AGENT_NAME;
-  let requiresE2E = process.env.CODEX_DISABLE_E2E !== '1';
-  let dshEnabled = process.env.CODEX_DSH_ENABLED !== '0';
-  let codexEnabled = process.env.CODEX_CODEX_ENABLED !== '0';
-  let opencodeEnabled = process.env.CODEX_OPENCODE_ENABLED === '1';
-  let desktopEnabled = process.env.CODEX_DESKTOP_ENABLED === '1';
-  let localWebEnabled = process.env.CODEX_LOCAL_WEB_ENABLED === '1';
+  let localWebEnabled = process.env.CODEX_LOCAL_WEB_ENABLED !== '0';
   let webServicesFile = process.env.CODEX_WEB_SERVICES_FILE;
   let threadId;
   let uploadName;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--relay' && args[i + 1]) relayUrl = args[++i];
-    else if ((args[i] === '--profile' || args[i] === '-p') && args[i + 1]) profile = args[++i];
     else if (args[i] === '--name' && args[i + 1]) { agentName = args[++i]; uploadName = agentName; }
-    else if (args[i] === '--no-e2e') requiresE2E = false;
-    else if (args[i] === '--no-dsh') dshEnabled = false;
-    else if (args[i] === '--dsh') dshEnabled = true;
-    else if (args[i] === '--no-codex') codexEnabled = false;
-    else if (args[i] === '--opencode') opencodeEnabled = true;
-    else if (args[i] === '--no-opencode') opencodeEnabled = false;
-    else if (args[i] === '--desktop') desktopEnabled = true;
-    else if (args[i] === '--no-desktop') desktopEnabled = false;
     else if (args[i] === '--local-web') localWebEnabled = true;
     else if (args[i] === '--no-local-web') localWebEnabled = false;
     else if (args[i] === '--services' && args[i + 1]) webServicesFile = path.resolve(args[++i]);
@@ -1126,14 +404,13 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
         console.log(`${service.name} [${service.status}]: ${service.url}`);
         if (service.password) console.log(`  username: ${service.username}\n  password: ${service.password}`);
       }
-    } catch { console.error('没有本机服务信息；请先用服务 spec 启动 Agent'); process.exitCode = 1; }
+    } catch {
+      console.error('没有本机服务信息；请先用服务 spec 启动 Agent');
+      process.exitCode = 1;
+    }
     process.exit(process.exitCode || 0);
   }
-  if (args.includes('--show-pairing-key')) {
-    const identity = loadOrCreateAgentIdentity(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'));
-    console.log(identity.localSigningKey);
-    process.exit(0);
-  }
+
   if (args.includes('--upload')) {
     const filePath = args[args.indexOf('--upload') + 1];
     try {
@@ -1141,12 +418,13 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       const file = await uploadAgentFile(filePath, { relayUrl, name: uploadName, threadId });
       console.log(JSON.stringify({ ok: true, file }));
     } catch (error) {
-      console.error(error.message); process.exitCode = 1;
+      console.error(error.message);
+      process.exitCode = 1;
     }
   } else {
     try { await waitForPreviousAgent({ wait: args.includes('--service-run') }); }
     catch (error) { console.error(error.message); process.exit(75); }
-    const agent = startLocalAgent({ relayUrl, profile, agentName, requiresE2E, dshEnabled, codexEnabled, opencodeEnabled, desktopEnabled, localWebEnabled, webServicesFile });
+    const agent = startLocalAgent({ relayUrl, agentName, localWebEnabled, webServicesFile });
     process.on('SIGINT', async () => { await agent.stop(); process.exit(0); });
     process.on('SIGTERM', async () => { await agent.stop(); process.exit(0); });
   }

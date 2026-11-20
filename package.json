@@ -1,14 +1,15 @@
 {
-  "name": "codex-remote",
+  "name": "remote-hub",
   "version": "1.0.0",
   "private": true,
   "license": "MIT",
   "type": "module",
-  "description": "Mobile Web Remote Control for local Codex App-Server with TOTP 2FA and E2E HMAC verification",
+  "description": "RemoteHub: Multi-Device Web Remote Control Hub for T3 Code and Local Web Services with TOTP 2FA and Cloud File Transfer",
   "engines": {
     "node": ">=20.0.0"
   },
   "bin": {
+    "remote-up": "./bin/codex-up",
     "codex-up": "./bin/codex-up"
   },
   "scripts": {

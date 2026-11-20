@@ -71,11 +71,11 @@ test('service install enables startup and linger; uninstall only removes generat
     SERVICE_TEST_LOG: log, https_proxy: 'http://127.0.0.1:7890' };
   const run = (...args) => spawnSync(process.execPath, [manager, ...args], { cwd: directory, env, encoding: 'utf8' });
   try {
-    const installed = run('install', '--profile', 'test-profile');
+    const installed = run('install', '--name', 'test-workstation');
     assert.equal(installed.status, 0, installed.stderr);
     const unit = path.join(configHome, 'systemd/user/codex-up.service');
     const environment = path.join(configHome, 'codex-remote/service.env');
-    assert.match(fs.readFileSync(unit, 'utf8'), /--profile" "test-profile/);
+    assert.match(fs.readFileSync(unit, 'utf8'), /--name" "test-workstation/);
     assert.equal(fs.statSync(environment).mode & 0o777, 0o600);
     const calls = fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
     assert.ok(calls.some((call) => call.command === 'systemctl' && call.args.includes('enable')));

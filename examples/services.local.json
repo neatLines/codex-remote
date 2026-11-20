@@ -2,6 +2,7 @@
   "services": [
     { "id": "dsh", "name": "DSH", "kind": "dsh", "port": 3081 },
     { "id": "opencode", "name": "OpenCode", "kind": "opencode", "port": 3082 },
+    { "id": "t3-code", "name": "T3 Code", "kind": "t3-code", "port": 3773 },
     { "id": "panel", "name": "9090 面板", "port": 9090, "path": "/ui/#/overview" }
   ]
 }

@@ -11,6 +11,7 @@ import { startLocalAgent } from '../src/local-agent.mjs';
 import { generateTotpCode } from '../src/crypto-auth.mjs';
 import { acceptWebSocketUpgrade, connectWebSocketClient } from '../src/ws-minimal.mjs';
 import { localWebScript, localCookiePrefix } from '../src/local-web.mjs';
+import { decodeChunk } from '../src/dsh-tunnel.mjs';
 
 async function until(check) {
   for (let i = 0; i < 250; i++) { if (check()) return; await new Promise(r => setTimeout(r, 20)); }
@@ -111,9 +112,34 @@ test('browser URL mapping retains mount paths, routes absolute loopback ports an
   await context.window.fetch('http://127.0.0.1:8080/api'); assert.equal(calls.pop()[0], 'https://gateway.test/local/agent/8080/api');
   await context.window.fetch('https://external.test/api'); assert.equal(calls.pop()[0], 'https://external.test/api');
   await context.window.fetch(new Request('http://127.0.0.1:9090/post', { method: 'POST', body: 'payload' }));
-  const request = calls.pop()[0]; assert.equal(request.url, 'https://gateway.test/local/agent/9090/post'); assert.equal(await request.text(), 'payload');
+  const [requestUrl, requestInit] = calls.pop();
+  assert.equal(requestUrl, 'https://gateway.test/local/agent/9090/post');
+  assert.equal(requestInit.method, 'POST'); assert.equal(await requestInit.body.text(), 'payload');
+  assert.equal(requestInit.headers.get('content-type'), 'text/plain;charset=UTF-8');
+  const put = new context.window.Request('http://127.0.0.1:9090/proxies/group', { method: 'PUT', body: '{"name":"node"}' });
+  assert.equal(put.url, 'https://gateway.test/local/agent/9090/proxies/group');
+  await context.window.fetch(put);
+  assert.equal(calls.pop()[0], put, 'already mapped requests must retain their native body source for HTTP/1.1 uploads');
+  const cloned = new context.window.Request(put);
+  await context.window.fetch(cloned.clone());
+  const clonedCall = calls.pop()[0]; assert.equal(await clonedCall.text(), '{"name":"node"}');
+  const external = new Request('https://external.test/submit', { method: 'POST', body: 'external' });
+  await context.window.fetch(external); assert.equal(calls.pop()[0], external);
+  const controller = new AbortController();
+  await context.window.fetch(new Request('http://127.0.0.1:9090/put', { method: 'POST', body: 'original' }),
+    { method: 'PUT', body: 'override', headers: { 'X-Fixture': 'retained' }, signal: controller.signal });
+  const [, override] = calls.pop();
+  assert.equal(override.method, 'PUT'); assert.equal(await override.body.text(), 'override');
+  assert.equal(override.headers.get('x-fixture'), 'retained');
+  controller.abort(); assert.equal(override.signal.aborted, true);
   new context.window.WebSocket('ws://localhost:9090/traffic'); assert.equal(calls.pop()[0], 'wss://gateway.test/local/agent/9090/traffic');
   assert.equal(context.window.localStorage.getItem('codex_e2e_key_agent'), null);
   context.window.localStorage.setItem('backend', 'saved'); assert.equal(storage.get('codex_local:agent:9090:backend'), 'saved');
   assert.equal((await context.navigator.serviceWorker.getRegistrations()).length, 0);
+});
+
+test('tunnel chunks reject malformed and unbounded input', () => {
+  assert.throws(() => decodeChunk('not base64!'), /Invalid/);
+  assert.throws(() => decodeChunk('AAAA'.repeat(30000)), /Invalid/);
+  assert.deepEqual(decodeChunk('AP8='), Buffer.from([0, 255]));
 });

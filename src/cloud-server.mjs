@@ -105,7 +105,7 @@ export function loadOrInitAuthState(dataDir, env = process.env) {
 }
 
 /**
- * Create a Cloud Relay + Mobile Web UI server instance.
+ * Create a Cloud Relay + Web Console server instance.
  * @param {{
  *   host?: string,
  *   port?: number,
@@ -207,22 +207,13 @@ export function createCloudServer(options = {}) {
         hostname: info.hostname,
         platform: info.platform,
         defaultCwd: info.defaultCwd,
-        profile: info.profile || null,
-        dshWeb: info.dshWeb || { enabled: false, status: 'disabled' },
-        opencodeWeb: info.opencodeWeb || { enabled: false, status: 'disabled' },
-        desktopWeb: info.desktopWeb || { enabled: false, status: 'disabled' },
         localWeb: info.localWeb || { enabled: false, status: 'disabled' },
         webServices: publicWebServices(info.webServices),
-        codexEnabled: info.codexEnabled !== false,
-        codexStatus: info.codexStatus || 'ready',
-        requiresE2E: Boolean(info.requiresE2E),
-        e2eKeyFingerprint: info.e2eKeyFingerprint || null,
         trusted: Boolean(authStore.state.trustedAgents[agentId]),
         connectedAt: info.connectedAt,
         online: true,
       });
     }
-    // Also include previously trusted offline agents
     for (const [agentId, saved] of Object.entries(authStore.state.trustedAgents)) {
       if (!agents.has(agentId)) {
         list.push({
@@ -231,16 +222,8 @@ export function createCloudServer(options = {}) {
           hostname: saved.hostname || '',
           platform: saved.platform || '',
           defaultCwd: saved.defaultCwd || '',
-          profile: saved.profile || null,
-          codexEnabled: saved.codexEnabled !== false,
-          codexStatus: 'offline',
-          dshWeb: { enabled: saved.dshWeb?.enabled === true, status: 'offline' },
-          opencodeWeb: { enabled: saved.opencodeWeb?.enabled === true, status: 'offline' },
-          desktopWeb: { enabled: saved.desktopWeb?.enabled === true, status: 'offline' },
           localWeb: { enabled: saved.localWeb?.enabled === true, status: 'offline' },
           webServices: saved.webServices?.map(service => ({ ...service, status: 'offline' })),
-          requiresE2E: Boolean(saved.requiresE2E),
-          e2eKeyFingerprint: saved.e2eKeyFingerprint || null,
           trusted: true,
           connectedAt: saved.lastSeenAt || null,
           online: false,
@@ -264,25 +247,17 @@ export function createCloudServer(options = {}) {
     });
   }
 
-  const dshProxy = createDshProxy({
-    agents, isAuthenticated: isRequestAuthenticated,
-    isTrusted: (agentId) => Boolean(authStore.state.trustedAgents[agentId]),
+  const localProxy = createDshProxy({
+    agents,
+    isAuthenticated: isRequestAuthenticated,
+    isTrusted: agentId => Boolean(authStore.state.trustedAgents[agentId]),
     publicOrigin: env.CODEX_PUBLIC_ORIGIN,
   });
-  const opencodeProxy = createDshProxy({
-    agents, isAuthenticated: isRequestAuthenticated,
-    isTrusted: (agentId) => Boolean(authStore.state.trustedAgents[agentId]),
-    publicOrigin: env.CODEX_PUBLIC_ORIGIN, service: 'opencode',
-  });
-  const desktopProxy = createDshProxy({
-    agents, isAuthenticated: isRequestAuthenticated,
-    isTrusted: (agentId) => Boolean(authStore.state.trustedAgents[agentId]),
-    publicOrigin: env.CODEX_PUBLIC_ORIGIN, service: 'desktop',
-  });
-  const localProxy = createDshProxy({ agents, isAuthenticated: isRequestAuthenticated,
-    isTrusted: agentId => Boolean(authStore.state.trustedAgents[agentId]),
-    publicOrigin: env.CODEX_PUBLIC_ORIGIN, service: 'local' });
-  const fileStore = createFileStore({ dataDir, env, authStore, isAuthenticated: isRequestAuthenticated,
+  const fileStore = createFileStore({
+    dataDir,
+    env,
+    authStore,
+    isAuthenticated: isRequestAuthenticated,
     onChange: (file) => broadcastToClients({ type: 'relay/filesChanged', file }),
   });
 
@@ -297,14 +272,18 @@ export function createCloudServer(options = {}) {
       })
     : http.createServer();
   const redirectServer = redirectOrigin ? http.createServer((req, res) => {
-    // Use the configured origin, never the untrusted Host header.
     const requestPath = req.url?.startsWith('/') ? req.url : '/';
     res.writeHead(308, { Location: `${redirectOrigin}${requestPath}`, 'Cache-Control': 'no-store' });
     res.end();
   }) : null;
-  const pollTransport = createHttpPollTransport({ server, isAuthenticated: isRequestAuthenticated,
-    readJsonBody, sendJson, publicOrigin: env.CODEX_PUBLIC_ORIGIN,
-    ...(options.pollTransportOptions || {}) });
+  const pollTransport = createHttpPollTransport({
+    server,
+    isAuthenticated: isRequestAuthenticated,
+    readJsonBody,
+    sendJson,
+    publicOrigin: env.CODEX_PUBLIC_ORIGIN,
+    ...(options.pollTransportOptions || {}),
+  });
 
   server.on('request', async (req, res) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -384,9 +363,6 @@ export function createCloudServer(options = {}) {
 
     // 3. Logout
     if (req.method === 'POST' && pathname === '/api/auth/logout') {
-      dshProxy.closeSession(req.headers.cookie);
-      opencodeProxy.closeSession(req.headers.cookie);
-      desktopProxy.closeSession(req.headers.cookie);
       localProxy.closeSession(req.headers.cookie);
       pollTransport.closeSession(req);
       sendJson(
@@ -441,15 +417,8 @@ export function createCloudServer(options = {}) {
           hostname: live?.hostname || '',
           platform: live?.platform || '',
           defaultCwd: live?.defaultCwd || '',
-          profile: live?.profile || null,
-          codexEnabled: live?.codexEnabled !== false,
-          dshWeb: live?.dshWeb,
-          opencodeWeb: live?.opencodeWeb,
-          desktopWeb: live?.desktopWeb,
           localWeb: live?.localWeb,
           webServices: publicWebServices(live?.webServices),
-          requiresE2E: Boolean(live?.requiresE2E),
-          e2eKeyFingerprint: live?.e2eKeyFingerprint || null,
           trustedAt: Date.now(),
           lastSeenAt: Date.now(),
         };
@@ -460,9 +429,6 @@ export function createCloudServer(options = {}) {
       } else {
         delete authStore.state.trustedAgents[agentId];
         fileStore.revoke(agentId);
-        dshProxy.revoke(agentId);
-        opencodeProxy.revoke(agentId);
-        desktopProxy.revoke(agentId);
         localProxy.revoke(agentId);
         if (live) {
           live.ws.send({ type: 'relay/trusted', trusted: false });
@@ -479,9 +445,6 @@ export function createCloudServer(options = {}) {
     }
 
     if (await fileStore.handleHttp(req, res)) return;
-    if (dshProxy.handleHttp(req, res)) return;
-    if (opencodeProxy.handleHttp(req, res)) return;
-    if (desktopProxy.handleHttp(req, res)) return;
     if (localProxy.handleHttp(req, res)) return;
 
     // 6. Serve Static Assets
@@ -510,9 +473,6 @@ export function createCloudServer(options = {}) {
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
-    if (dshProxy.handleUpgrade(req, socket, head)) return;
-    if (opencodeProxy.handleUpgrade(req, socket, head)) return;
-    if (desktopProxy.handleUpgrade(req, socket, head)) return;
     if (localProxy.handleUpgrade(req, socket, head)) return;
 
     if (url.pathname === '/ws/client') {
@@ -546,57 +506,6 @@ export function createCloudServer(options = {}) {
 
         if (msg.type === 'client/ping') {
           ws.send({ type: 'relay/pong', ts: Date.now() });
-          return;
-        }
-
-        if (msg.type === 'client/rpc') {
-          const { agentId, payload, e2e } = msg;
-          const targetAgent = agents.get(agentId);
-          if (!targetAgent) {
-            ws.send({
-              type: 'relay/error',
-              agentId,
-              requestId: payload?.id ?? null,
-              error: '目标本地 Agent 当前不在线',
-            });
-            return;
-          }
-
-          if (!authStore.state.trustedAgents[agentId]) {
-            ws.send({
-              type: 'relay/error',
-              agentId,
-              requestId: payload?.id ?? null,
-              error: '该设备尚未被信任，请先在顶部点击【信任该设备】',
-            });
-            return;
-          }
-
-          targetAgent.ws.send({
-            type: 'relay/client_rpc',
-            clientId,
-            payload,
-            e2e: e2e || null,
-          });
-
-          // Broadcast mutating actions to other mobile devices so multiple phones stay in sync
-          if (
-            payload?.method === 'turn/start' ||
-            payload?.method === 'turn/steer' ||
-            payload?.method === 'turn/interrupt' ||
-            payload?.result !== undefined
-          ) {
-            for (const other of clients) {
-              if (other !== clientObj) {
-                other.ws.send({
-                  type: 'relay/client_sync',
-                  agentId,
-                  fromClientId: clientId,
-                  payload,
-                });
-              }
-            }
-          }
         }
       });
 
@@ -628,7 +537,6 @@ export function createCloudServer(options = {}) {
             return;
           }
 
-          // Replace old connection if same agentId reconnects
           const existing = agents.get(agentId);
           if (existing && existing.ws !== ws) {
             existing.ws.close(1000, 'Replaced by new connection');
@@ -645,19 +553,8 @@ export function createCloudServer(options = {}) {
             hostname: String(msg.hostname || ''),
             platform: String(msg.platform || ''),
             defaultCwd: String(msg.defaultCwd || ''),
-            profile: msg.profile ? String(msg.profile) : null,
-            requiresE2E: Boolean(msg.requiresE2E),
             fileUploads: msg.fileUploads === true,
-            codexEnabled: msg.codexEnabled !== false,
-            codexStatus: ['starting', 'ready', 'error', 'disabled'].includes(msg.codexStatus) ? msg.codexStatus : 'ready',
-            e2eKeyFingerprint: msg.e2eKeyFingerprint ? String(msg.e2eKeyFingerprint) : null,
             connectedAt: Date.now(),
-            dshWeb: { enabled: msg.dshWeb?.enabled === true,
-              status: ['starting', 'ready', 'error'].includes(msg.dshWeb?.status) ? msg.dshWeb.status : 'disabled' },
-            opencodeWeb: { enabled: msg.opencodeWeb?.enabled === true,
-              status: ['starting', 'ready', 'error'].includes(msg.opencodeWeb?.status) ? msg.opencodeWeb.status : 'disabled' },
-            desktopWeb: { enabled: msg.desktopWeb?.enabled === true,
-              status: ['starting', 'ready', 'error'].includes(msg.desktopWeb?.status) ? msg.desktopWeb.status : 'disabled' },
             localWeb: { enabled: msg.localWeb?.enabled === true, status: msg.localWeb?.enabled === true ? 'ready' : 'disabled' },
             webServices,
           };
@@ -671,15 +568,8 @@ export function createCloudServer(options = {}) {
               hostname: agentInfo.hostname,
               platform: agentInfo.platform,
               defaultCwd: agentInfo.defaultCwd,
-              profile: agentInfo.profile,
-              codexEnabled: agentInfo.codexEnabled,
-              dshWeb: agentInfo.dshWeb,
-              opencodeWeb: agentInfo.opencodeWeb,
-              desktopWeb: agentInfo.desktopWeb,
               localWeb: agentInfo.localWeb,
               webServices: publicWebServices(agentInfo.webServices),
-              requiresE2E: agentInfo.requiresE2E,
-              e2eKeyFingerprint: agentInfo.e2eKeyFingerprint,
               lastSeenAt: Date.now(),
             };
             authStore.save();
@@ -699,9 +589,6 @@ export function createCloudServer(options = {}) {
         }
 
         if (!registeredAgentId) return;
-        if (dshProxy.handleMessage(registeredAgentId, ws, msg)) return;
-        if (opencodeProxy.handleMessage(registeredAgentId, ws, msg)) return;
-        if (desktopProxy.handleMessage(registeredAgentId, ws, msg)) return;
         if (localProxy.handleMessage(registeredAgentId, ws, msg)) return;
         if (msg.type === 'agent/services') {
           const agent = agents.get(registeredAgentId);
@@ -714,70 +601,10 @@ export function createCloudServer(options = {}) {
             localProxy.servicesChanged(registeredAgentId);
             broadcastAgentsUpdate();
           }
-          return;
-        }
-        if (msg.type === 'agent/codex_status') {
-          const agent = agents.get(registeredAgentId);
-          if (agent?.ws === ws && agent.codexStatus !== msg.status && ['starting', 'ready', 'error', 'disabled'].includes(msg.status)) {
-            agent.codexStatus = msg.status;
-            broadcastAgentsUpdate();
-          }
-          return;
-        }
-        if (msg.type === 'agent/desktop_status') {
-          const agent = agents.get(registeredAgentId);
-          if (agent?.ws === ws) {
-            agent.desktopWeb = { enabled: msg.desktopWeb?.enabled === true,
-              status: ['starting', 'ready', 'error'].includes(msg.desktopWeb?.status) ? msg.desktopWeb.status : 'disabled' };
-            broadcastAgentsUpdate();
-          }
-          return;
-        }
-        if (msg.type === 'agent/opencode_status') {
-          const agent = agents.get(registeredAgentId);
-          if (agent?.ws === ws) {
-            agent.opencodeWeb = { enabled: msg.opencodeWeb?.enabled === true,
-              status: ['starting', 'ready', 'error'].includes(msg.opencodeWeb?.status) ? msg.opencodeWeb.status : 'disabled' };
-            broadcastAgentsUpdate();
-          }
-          return;
-        }
-        if (msg.type === 'agent/dsh_status') {
-          const agent = agents.get(registeredAgentId);
-          if (agent?.ws === ws) {
-            agent.dshWeb = { enabled: msg.dshWeb?.enabled === true,
-              status: ['starting', 'ready', 'error'].includes(msg.dshWeb?.status) ? msg.dshWeb.status : 'disabled' };
-            broadcastAgentsUpdate();
-          }
-          return;
-        }
-
-        if (msg.type === 'agent/rpc') {
-          // Broadcast all Codex RPC responses, streaming notifications, and approval requests to all mobile devices
-          broadcastToClients({
-            type: 'relay/rpc',
-            agentId: registeredAgentId,
-            clientId: msg.clientId || null,
-            payload: msg.payload,
-          });
-          return;
-        }
-
-        if (msg.type === 'agent/e2e_error') {
-          broadcastToClients({
-            type: 'relay/e2e_error',
-            agentId: registeredAgentId,
-            clientId: msg.clientId || null,
-            requestId: msg.requestId ?? null,
-            reason: msg.reason || '端到端签名校验失败',
-          });
         }
       });
 
       ws.on('close', () => {
-        dshProxy.disconnect(ws);
-        opencodeProxy.disconnect(ws);
-        desktopProxy.disconnect(ws);
         localProxy.disconnect(ws);
         if (registeredAgentId && agents.get(registeredAgentId)?.ws === ws) {
           agents.delete(registeredAgentId);
@@ -835,7 +662,7 @@ export function createCloudServer(options = {}) {
       const actualPort = typeof address === 'object' && address ? address.port : port;
       if (!options.quiet) {
         console.log('==========================================================');
-        console.log('🚀 Codex Remote Cloud Server Started');
+        console.log('🚀 RemoteHub Cloud Server Started');
         console.log(`🌐 Listen Address : ${tlsEnabled ? 'https' : 'http'}://${host}:${actualPort}`);
         console.log(`📂 Auth State File: ${authStore.stateFile}`);
         console.log('🔐 登录口令与 TOTP 初始化资料仅保存在上述文件，不写入日志。');
@@ -847,9 +674,6 @@ export function createCloudServer(options = {}) {
       clearInterval(pingTimer);
       pollTransport.close();
       fileStore.close();
-      dshProxy.close();
-      opencodeProxy.close();
-      desktopProxy.close();
       localProxy.close();
       for (const c of clients) c.ws.close();
       for (const a of agents.values()) a.ws.close();

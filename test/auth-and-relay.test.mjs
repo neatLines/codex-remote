@@ -1,17 +1,15 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
 import { createCloudServer } from '../src/cloud-server.mjs';
 import {
-  E2EVerifier,
   generateTotpCode,
   generateTotpSecret,
   hashPassword,
   LoginRateLimiter,
-  signE2EPayload,
   signSessionToken,
   verifyPassword,
   verifySessionToken,
@@ -57,34 +55,15 @@ test('Password hashing, session token signing, and brute-force rate limiter', ()
   assert.equal(locked.reason, 'locked');
 });
 
-test('E2E HMAC signature verification and replay prevention', () => {
-  const key = 'ABCD-1234-EFGH';
-  const verifier = new E2EVerifier(key, { maxSkewMs: 30000 });
-  const now = Date.now();
-  const bodyString = JSON.stringify({ id: '1', method: 'turn/start', params: { text: 'hi' } });
-  const nonce = 'nonce_123456';
-  const signature = signE2EPayload(key, { timestamp: now, nonce, bodyString });
-
-  const first = verifier.verify({ timestamp: now, nonce, bodyString, signature }, now);
-  assert.equal(first.ok, true);
-
-  // Replay with same nonce must fail
-  const replay = verifier.verify({ timestamp: now, nonce, bodyString, signature }, now + 100);
-  assert.equal(replay.ok, false);
-  assert.equal(replay.reason, 'replay_detected');
-
-  // Expired timestamp must fail
-  const expiredSig = signE2EPayload(key, { timestamp: now - 60000, nonce: 'nonce_999999', bodyString });
-  const expired = verifier.verify(
-    { timestamp: now - 60000, nonce: 'nonce_999999', bodyString, signature: expiredSig },
-    now
-  );
-  assert.equal(expired.ok, false);
-  assert.equal(expired.reason, 'timestamp_out_of_range');
-});
-
-test('Full E2E integration: Cloud Relay + Local Agent + Mobile Client over WebSocket', async () => {
+test('Full integration: Cloud Relay + Local Agent + Web Client over WebSocket', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-remote-test-'));
+  const upstream = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ ok: true, path: req.url }));
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  const servicePort = upstream.address().port;
+
   const cloud = createCloudServer({
     host: '127.0.0.1',
     port: 0,
@@ -122,17 +101,14 @@ test('Full E2E integration: Cloud Relay + Local Agent + Mobile Client over WebSo
       agentName: 'test-workstation',
       codexHome: path.join(tmpDir, 'agent'),
       defaultCwd: tmpDir,
-      codexBin: fileURLToPath(new URL('./fixtures/fake-codex.mjs', import.meta.url)),
+      webServices: [{ id: 't3-code', name: 'T3 Code', port: servicePort }],
       quiet: true,
     });
 
-    // 3. Connect Mobile Client WebSocket
+    // 3. Connect Web Client WebSocket
     clientWs = await connectWebSocketClient(`${wsBaseUrl}/ws/client`, {
       headers: { Cookie: cookieHeader },
     });
-
-    const received = [];
-    clientWs.on('message', (raw) => received.push(JSON.parse(raw)));
 
     // Wait for agent to appear in relay/agents or relay/welcome
     const agentId = await new Promise((resolve, reject) => {
@@ -140,7 +116,7 @@ test('Full E2E integration: Cloud Relay + Local Agent + Mobile Client over WebSo
       clientWs.on('message', (raw) => {
         const msg = JSON.parse(raw);
         if ((msg.type === 'relay/welcome' || msg.type === 'relay/agents') && Array.isArray(msg.agents)) {
-          const found = msg.agents.find((a) => a.online);
+          const found = msg.agents.find((a) => a.online && a.webServices?.[0]?.status === 'ready');
           if (found) {
             clearTimeout(timer);
             resolve(found.agentId);
@@ -149,7 +125,13 @@ test('Full E2E integration: Cloud Relay + Local Agent + Mobile Client over WebSo
       });
     });
 
-    // 4. Trust the newly registered local agent
+    // 4. Before trusting, forwarding is rejected
+    const untrustedRes = await fetch(`${baseUrl}/local/${agentId}/${servicePort}/api/test`, {
+      headers: { Cookie: cookieHeader, Origin: baseUrl },
+    });
+    assert.equal(untrustedRes.status, 403);
+
+    // 5. Trust the newly registered local agent
     const trustRes = await fetch(`${baseUrl}/api/agents/trust`, {
       method: 'POST',
       headers: {
@@ -160,76 +142,17 @@ test('Full E2E integration: Cloud Relay + Local Agent + Mobile Client over WebSo
     });
     assert.equal(trustRes.status, 200);
 
-    // 5. Request workspaces and threads across all desktop projects
-    const rpcPromise = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('Timeout waiting for workspaces RPC')), 10000);
-      clientWs.on('message', (raw) => {
-        const msg = JSON.parse(raw);
-        if (msg.type === 'relay/rpc' && msg.payload?.id === 'req_ws_1') {
-          clearTimeout(timer);
-          resolve(msg.payload);
-        }
-      });
+    // 6. Access forwarded service through trusted relay
+    const forwardedRes = await fetch(`${baseUrl}/local/${agentId}/${servicePort}/api/test`, {
+      headers: { Cookie: cookieHeader, Origin: baseUrl },
     });
-
-    clientWs.send({
-      type: 'client/rpc',
-      agentId,
-      payload: {
-        id: 'req_ws_1',
-        method: 'remote/getWorkspacesAndThreads',
-        params: { limit: 20 },
-      },
-    });
-
-    const rpcResponse = await rpcPromise;
-    assert.ok(!rpcResponse.error, `Unexpected RPC error: ${JSON.stringify(rpcResponse.error)}`);
-    assert.ok(Array.isArray(rpcResponse.result.projects), 'Expected projects array');
-    assert.ok(Array.isArray(rpcResponse.result.threads), 'Expected threads array');
-    assert.ok(rpcResponse.result.projects.length > 0, 'Expected workspaces to be discovered');
-
-    function waitForPayload(predicate) {
-      const found = received.find((message) => message.type === 'relay/rpc' && predicate(message.payload));
-      if (found) return Promise.resolve(found.payload);
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => { clientWs.off('message', onMessage); reject(new Error('Timeout waiting for fixture RPC')); }, 5000);
-        function onMessage(raw) {
-          const message = JSON.parse(raw);
-          if (message.type !== 'relay/rpc' || !predicate(message.payload)) return;
-          clearTimeout(timer);
-          clientWs.off('message', onMessage);
-          resolve(message.payload);
-        }
-        clientWs.on('message', onMessage);
-      });
-    }
-    function sendRpc(id, method, params) {
-      const payload = { id, method, params };
-      const timestamp = Date.now();
-      const nonce = `fixture_${id}`;
-      const signature = signE2EPayload(localAgent.identity.localSigningKey, {
-        timestamp, nonce, bodyString: JSON.stringify(payload),
-      });
-      clientWs.send({ type: 'client/rpc', agentId, payload, e2e: { timestamp, nonce, signature } });
-      return waitForPayload((response) => response.id === id);
-    }
-
-    // A history request lasting longer than the 350ms lock-release delay must survive.
-    await sendRpc('turn_ok', 'turn/start', { threadId: 'fixture-thread', input: [{ type: 'text', text: 'hello' }] });
-    await waitForPayload((payload) => payload.method === 'turn/completed');
-    const history = await sendRpc('history_slow', 'thread/turns/list', { threadId: 'fixture-thread' });
-    assert.ok(Array.isArray(history.result?.data), 'In-flight history must not be killed by recycling');
-
-    // A rejected start must not leave the thread permanently marked active.
-    const rejected = await sendRpc('turn_fail', 'turn/start', { threadId: 'fixture-thread', input: [{ type: 'text', text: 'fail' }] });
-    assert.match(rejected.error.message, /fixture rejected turn/);
-    await new Promise((resolve) => setTimeout(resolve, 700));
-    const log = fs.readFileSync(path.join(tmpDir, 'fake-codex.log'), 'utf8');
-    assert.ok(log.split(' start\n').length >= 3, 'Rejected turns should release locks and allow recycling');
+    assert.equal(forwardedRes.status, 200);
+    assert.deepEqual(await forwardedRes.json(), { ok: true, path: '/api/test' });
   } finally {
     if (clientWs) clientWs.close();
     if (localAgent) localAgent.stop();
     await cloud.close();
+    await new Promise((resolve) => upstream.close(resolve));
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
