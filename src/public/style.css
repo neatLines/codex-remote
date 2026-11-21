@@ -1066,6 +1066,13 @@ html, body {
   overflow-wrap: anywhere;
 }
 
+.cloud-file-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
 .cloud-file-download {
   flex-shrink: 0;
   text-decoration: none;

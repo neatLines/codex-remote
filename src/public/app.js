@@ -587,12 +587,39 @@ function renderCloudFiles() {
     const name = document.createElement('div'); name.className = 'cloud-file-name'; name.textContent = file.name;
     const metadata = document.createElement('div'); metadata.className = 'cloud-file-meta';
     metadata.textContent = `${formatFileBytes(file.size)} · ${file.agentName || 'Agent'} · ${new Date(file.createdAt).toLocaleString()}`;
+    const actions = document.createElement('div'); actions.className = 'cloud-file-actions';
     const download = document.createElement('a'); download.className = 'btn-small cloud-file-download';
     download.href = `/api/files/${file.id}/download`; download.download = file.name; download.textContent = '下载';
-    info.appendChild(name); info.appendChild(metadata); row.appendChild(info); row.appendChild(download);
+    const delBtn = document.createElement('button'); delBtn.type = 'button';
+    delBtn.className = 'btn-ghost btn-sm danger-text cloud-file-delete'; delBtn.textContent = '删除';
+    delBtn.onclick = () => deleteCloudFile(file.id, delBtn);
+    info.appendChild(name); info.appendChild(metadata);
+    actions.appendChild(download); actions.appendChild(delBtn);
+    row.appendChild(info); row.appendChild(actions);
     el.filesList.appendChild(row);
   }
   el.btnMoreFiles.classList.toggle('hidden', !state.files.nextCursor);
+}
+
+async function deleteCloudFile(fileId, button) {
+  if (!/^[a-f0-9]{32}$/.test(fileId)) return;
+  if (button) button.disabled = true;
+  try {
+    const response = await fetch(`/api/files/${fileId}`, { method: 'DELETE' });
+    const data = await response.json();
+    if (!response.ok || !data.ok) {
+      throw new Error(response.status === 401 ? '登录已过期，请重新登录后操作' : data.error || '删除文件失败');
+    }
+    state.files.items = state.files.items.filter((item) => item.id !== fileId);
+    if (data.storage) {
+      el.filesStorage.textContent = `已用 ${formatFileBytes(data.storage.usedBytes)} / ${formatFileBytes(data.storage.maxBytes)}`;
+    }
+    renderCloudFiles();
+    el.filesStatus.textContent = state.files.items.length ? '' : '暂无文件。Agent 上传后会显示在这里。';
+  } catch (error) {
+    if (button) button.disabled = false;
+    el.filesStatus.textContent = error.message;
+  }
 }
 
 async function loadCloudFiles({ more = false } = {}) {

@@ -169,6 +169,22 @@ export function createFileStore({ dataDir, env = {}, authStore, isAuthenticated,
     } finally { await handle.close().catch(() => {}); }
   }
 
+  async function remove(res, id) {
+    if (closed) throw fail(503, '文件服务正在关闭');
+    const file = records.get(id);
+    if (!file) throw fail(404, '文件不存在');
+    records.delete(id);
+    usedBytes = Math.max(0, usedBytes - file.size);
+    await fs.promises.unlink(path.join(directory, `${id}.json`)).catch(() => {});
+    await fs.promises.unlink(path.join(directory, `${id}.blob`)).catch(() => {});
+    json(res, 200, {
+      ok: true,
+      id,
+      storage: { usedBytes, maxBytes: maxStorageBytes, fileCount: records.size },
+    });
+    onChange({ id, deleted: true });
+  }
+
   return {
     revoke(agentId) {
       for (const entry of pending.values()) if (entry.agentId === agentId) entry.controller.abort();
@@ -194,8 +210,13 @@ export function createFileStore({ dataDir, env = {}, authStore, isAuthenticated,
         if (req.method === 'POST' && url.pathname === '/api/files') await upload(req, res);
         else {
           if (!isAuthenticated(req)) throw fail(401, '请先登录后访问文件');
+          if (req.headers['sec-fetch-site'] === 'cross-site') throw fail(403, '跨站文件操作被拒绝');
           if (req.method === 'GET' && url.pathname === '/api/files') list(url, res);
-          else {
+          else if (req.method === 'DELETE') {
+            const match = /^\/api\/files\/([a-f0-9]{32})$/.exec(url.pathname);
+            if (!match) throw fail(404, 'Not Found');
+            await remove(res, match[1]);
+          } else {
             const match = /^\/api\/files\/([a-f0-9]{32})\/download$/.exec(url.pathname);
             if (!match || !['GET', 'HEAD'].includes(req.method)) throw fail(404, 'Not Found');
             try { await download(req, res, match[1]); }

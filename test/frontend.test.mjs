@@ -263,29 +263,53 @@ test('login resumes the local web destination with its hash route and rejects ex
   assert.equal(redirects.length, 1);
 });
 
-test('cloud files modal renders uploaded files, storage summary and pagination', async () => {
+test('cloud files modal renders uploaded files, storage summary, pagination and deletion', async () => {
+  const calls = [];
+  const fileId = 'a'.repeat(32);
   const app = setup({
-    fetch: async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({
+    fetch: async (url, options = {}) => {
+      calls.push({ url, method: options.method || 'GET' });
+      if (options.method === 'DELETE') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            id: fileId,
+            storage: { usedBytes: 0, maxBytes: 1048576 },
+          }),
+        };
+      }
+      return {
         ok: true,
-        files: [
-          {
-            id: 'a'.repeat(32),
-            name: 'archive.tar.gz',
-            size: 2048,
-            agentName: '开发主机',
-            createdAt: 1762056000000,
-          },
-        ],
-        nextCursor: 'cursor_2',
-        storage: { usedBytes: 2048, maxBytes: 1048576 },
-      }),
-    }),
+        status: 200,
+        json: async () => ({
+          ok: true,
+          files: [
+            {
+              id: fileId,
+              name: 'archive.tar.gz',
+              size: 2048,
+              agentName: '开发主机',
+              createdAt: 1762056000000,
+            },
+          ],
+          nextCursor: 'cursor_2',
+          storage: { usedBytes: 2048, maxBytes: 1048576 },
+        }),
+      };
+    },
   });
   await app.loadCloudFiles();
   assert.equal(app.el.filesList.children.length, 1);
   assert.match(app.el.filesStorage.textContent, /2\.0 KiB \/ 1\.0 MiB/);
   assert.equal(app.el.btnMoreFiles.classList.contains('hidden'), false);
+  const actions = app.el.filesList.children[0].children[1];
+  const delBtn = actions.children[1];
+  assert.equal(delBtn.textContent, '删除');
+  await delBtn.onclick();
+  assert.deepEqual(calls.at(-1), { url: `/api/files/${fileId}`, method: 'DELETE' });
+  assert.equal(app.el.filesList.children.length, 0);
+  assert.match(app.el.filesStorage.textContent, /0 B \/ 1\.0 MiB/);
+  assert.match(app.el.filesStatus.textContent, /暂无文件/);
 });

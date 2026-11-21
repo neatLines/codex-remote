@@ -131,6 +131,17 @@ test('file limits, malicious names, pagination, duplicate names and empty files 
     assert.equal((await (await env.request('/api/files')).json()).files.length, 3);
     assert.equal(await (await env.request(first.downloadUrl)).text(), '1234567');
     assert.equal(await (await env.request(second.downloadUrl)).text(), 'ABCDEFG');
+    assert.equal((await fetch(`${env.base}/api/files/${first.id}`, { method: 'DELETE' })).status, 401);
+    assert.equal((await env.request(`/api/files/${first.id}`, { method: 'DELETE', headers: { 'Sec-Fetch-Site': 'cross-site' } })).status, 403);
+    const deleted = await env.request(`/api/files/${first.id}`, { method: 'DELETE' });
+    assert.equal(deleted.status, 200);
+    const deletedData = await deleted.json();
+    assert.equal(deletedData.ok, true);
+    assert.equal(deletedData.storage.usedBytes, 7);
+    assert.equal(deletedData.storage.fileCount, 2);
+    assert.equal((await env.request(first.downloadUrl)).status, 404);
+    assert.equal((await env.request(`/api/files/${first.id}`, { method: 'DELETE' })).status, 404);
+    assert.equal((await post('after-delete.txt', '12345678')).status, 201);
   } finally { await env.close(); }
 });
 
